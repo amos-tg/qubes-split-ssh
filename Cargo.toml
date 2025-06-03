@@ -1,0 +1,3 @@
+[workspace]
+members = ["split-ssh-setup", "ssh-client-sock-handler", "ssh-vault-sock-handler"]
+default-members = ["split-ssh-setup", "ssh-client-sock-handler", "ssh-vault-sock-handler"] 
