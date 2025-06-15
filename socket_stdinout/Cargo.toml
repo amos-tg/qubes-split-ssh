@@ -1,0 +1,9 @@
+[package]
+name = "socket_stdinout"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+log = { version = "0.1.0", path = "../../log" }
+tokio = { version = "1.45.1", features = ["full"] }
