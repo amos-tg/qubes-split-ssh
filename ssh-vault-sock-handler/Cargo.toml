@@ -1,9 +1,0 @@
-[package]
-name = "ssh-vault-sock-handler"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-anyhow = "1.0.98"
-log = { path = "../../log" }
-tokio = "1.45.0"
