@@ -7,5 +7,4 @@ edition = "2024"
 anyhow = "1.0.98"
 log = { path = "../../log" }
 tokio = { version = "1.45.0", features = [ "full" ] }
-vault_handler = { path = "../vault_handler" }
 socket_stdinout = { path = "../socket_stdinout" }

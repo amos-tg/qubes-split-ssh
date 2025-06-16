@@ -33,12 +33,12 @@ async fn main() {
         res.expect("Error: failed to get_auth_sock")
     };
 
-    let res = stream.handle_connections(
+    let con_res = stream.handle_connections(
         crate::INITIAL_STATE_W_FLAG,
         qchild_stdin,
         qchild_stdout,
     ).await;
 
-    log_err_append!(&res, ERR_LOG_DIR_NAME);
-    res.expect("Error: handle_connections returned");
+    log_err_append!(&con_res, ERR_LOG_DIR_NAME);
+    con_res.expect("Error: handle_connections returned");
 }

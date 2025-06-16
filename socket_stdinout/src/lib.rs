@@ -31,7 +31,6 @@ use tokio::{
     time,
     fs,
     sync::Mutex,
-    process::{ChildStdin, ChildStdout},
 };
 
 use anyhow::anyhow;
@@ -86,19 +85,18 @@ pub struct SockStdInOutCon {
     sock_reader: TaskHandle,
 }
 
-impl SockStdInOutCon {
+impl<'a> SockStdInOutCon {
     pub async fn spawn(
         stream: UnixStream,
         initial_write_flag_state: bool,
-        stdin: Arc<Mutex<ChildStdin>>,
-        stdout: Arc<Mutex<ChildStdout>>,
+        std_written: Arc<Mutex<impl AsyncWriteExt + Unpin + Send + 'static>>,
+        std_read: Arc<Mutex<impl AsyncReadExt + Unpin + Send + 'static>>,
     ) -> DynFutError<()> {
         let write_flag = Arc::new(
             AtomicBool::new(initial_write_flag_state)
         );
 
         let (read_half, write_half) = stream.into_split();
-
         let (read_half, write_half) = (
             Arc::new(read_half),
             Arc::new(Mutex::new(write_half)),
@@ -126,7 +124,7 @@ impl SockStdInOutCon {
 
         let fd_reader = { 
             let fd_reader = FdReader {
-                read: stdout.clone(),
+                read: std_read.clone(),
                 buf: sockw_fdr_buf.clone(),
                 write_flag: write_flag.clone(),
             }.new();
@@ -136,7 +134,7 @@ impl SockStdInOutCon {
 
         let fd_writer = {
             let fd_writer = FdWriter {
-                written: stdin.clone(),
+                written: std_written.clone(),
                 buf: sockr_fdw_buf.clone(),
                 write_flag: write_flag.clone(),
             }.new();
@@ -432,12 +430,12 @@ impl SockStream {
     pub async fn handle_connections(
         &mut self,
         initial_write_flag_state: bool,
-        stdin: ChildStdin,
-        stdout: ChildStdout,
+        std_written: impl AsyncWriteExt + Unpin + Send + 'static,
+        std_read: impl AsyncReadExt + Unpin + Send + 'static,
     ) -> DynFutError<()> {
-        let (stdin, stdout) = (
-            Arc::new(Mutex::new(stdin)),
-            Arc::new(Mutex::new(stdout)),
+        let (std_written, std_read) = (
+            Arc::new(Mutex::new(std_written)),
+            Arc::new(Mutex::new(std_read)),
         );
 
         loop {
@@ -445,8 +443,8 @@ impl SockStream {
             SockStdInOutCon::spawn(
                 stream, 
                 initial_write_flag_state,
-                stdin.clone(),
-                stdout.clone(),
+                std_written.clone(),
+                std_read.clone(),
             ).await?;
         }
     } 

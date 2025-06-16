@@ -70,7 +70,6 @@ dependencies = [
  "log",
  "socket_stdinout",
  "tokio",
- "vault_handler",
 ]
 
 [[package]]
@@ -296,6 +295,7 @@ dependencies = [
  "anyhow",
  "log",
  "socket_stdinout",
+ "tokio",
 ]
 
 [[package]]
