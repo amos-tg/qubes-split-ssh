@@ -27,8 +27,8 @@ async fn main() {
         ),
     );
 
-    let mut stream = {
-        let res = sock::SockStream::get_auth_sock().await;
+    let stream = {
+        let res = sock::SockListener::get_auth_sock().await;
         log_err_append!(&res, ERR_LOG_DIR_NAME);
         res.expect("Error: failed to get_auth_sock")
     };

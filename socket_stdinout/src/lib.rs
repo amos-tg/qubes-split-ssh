@@ -53,6 +53,7 @@ macro_rules! wield_err {
     };
 }
 
+#[cfg(debug_assertions)]
 async fn debug_buf_to_file(
     buf: impl AsRef<[u8]>, 
     fname: &str,
@@ -149,8 +150,6 @@ impl<'a> SockStdInOutCon {
         }.handler().await;
     }
 
-    // could have been a macro but it is what it is.
-    // I was tired when I wrote this.
     async fn handler(self) -> DynFutError<()> {
         const HNDLER_ERR: &str = "finished with an impossible return val.";
         loop { 
@@ -204,14 +203,27 @@ struct FdWriter<U: AsyncWriteExt + Unpin> {
 }
 
 impl<U: AsyncWriteExt + Unpin> FdWriter<U> {
+    const DEBUG_FNAME: &str = "FdWriter"; 
     pub async fn new(self) -> DynFutError<()> {
         loop {
-            match self.write_flag.load(SeqCst) { 
-                WRITABLE => (),
-                UNWRITABLE => time::sleep(
-                    Duration::from_millis(SLEEP_TIME_MILLIS)
-                ).await,
+            debug_buf_to_file(
+                "Startup\n",
+                Self::DEBUG_FNAME,
+            ).await?;
+
+            loop {
+                match self.write_flag.load(SeqCst) { 
+                    WRITABLE => break,
+                    UNWRITABLE => time::sleep(
+                        Duration::from_millis(SLEEP_TIME_MILLIS)
+                    ).await,
+                }
             }
+
+            debug_buf_to_file(
+                "Got WRITABLE flag state...\n",
+                Self::DEBUG_FNAME,
+            ).await?;
 
             let mut buf;
             let mut buf_len;
@@ -249,6 +261,11 @@ impl<U: AsyncWriteExt + Unpin> FdWriter<U> {
 
             if let Err(e) = written.flush().await { return Err(Box::new(e)); }
             buf.clear();
+
+            debug_buf_to_file(
+                "Wrote everything...\n",
+                Self::DEBUG_FNAME,
+            ).await?;
         }
     } 
 }
@@ -260,8 +277,14 @@ struct FdReader<T: AsyncReadExt + Unpin> {
 }
 
 impl<T: AsyncReadExt + Unpin> FdReader<T> {
+    const DEBUG_FNAME: &str = "FdReader";
     pub async fn new(self) -> DynFutError<()> {
         loop {
+            debug_buf_to_file(
+                "Startup...",
+                Self::DEBUG_FNAME,
+            ).await?;
+
             let mut buf = self.buf.lock().await;
             if !buf.is_empty() { 
                 drop(buf);
@@ -274,6 +297,11 @@ impl<T: AsyncReadExt + Unpin> FdReader<T> {
             let mut read = self.read.lock().await;
             let mut num_bytes = 0;
             let msg_len;
+
+            debug_buf_to_file(
+                "starting read...\n",
+                Self::DEBUG_FNAME,
+            ).await?;
 
             loop {
                 match read.read(&mut buf).await {
@@ -289,6 +317,11 @@ impl<T: AsyncReadExt + Unpin> FdReader<T> {
 
             msg_len = MsgHeader::len(&buf[..8]);
             num_bytes -= 8;
+
+            debug_buf_to_file(
+                format!("Message length: {}\n", msg_len), 
+                Self::DEBUG_FNAME,
+            ).await?;
 
             if num_bytes as u64 != msg_len {
                 loop {
@@ -306,8 +339,13 @@ impl<T: AsyncReadExt + Unpin> FdReader<T> {
 
             self.write_flag.store(WRITABLE, SeqCst);
 
-            #[cfg(debug_assertions)]
-            debug_buf_to_file(&*buf.clone(), "fd_reader").await?;
+            debug_buf_to_file(
+                format!(
+                    "What was read: {}\n",
+                    wield_err!(str::from_utf8(&*buf.clone())),
+                ),
+                Self::DEBUG_FNAME,
+            ).await?;
         }
     }
 }
@@ -318,8 +356,14 @@ struct SockWriter {
 }
 
 impl SockWriter {
+    const DEBUG_FNAME: &str = "SockWriter";
     pub async fn new(self) -> DynFutError<()> {
         loop {
+            debug_buf_to_file(
+                "starting...\n",
+                Self::DEBUG_FNAME,
+            ).await?;
+
             let mut written = self.written.lock().await;
             let mut buf = self.buf.lock().await;
 
@@ -334,6 +378,11 @@ impl SockWriter {
             let mut bytes = 0;
             let msg_len = MsgHeader::len(&buf[..8]);
 
+            debug_buf_to_file(
+                format!("starting {} length write...\n", msg_len),
+                Self::DEBUG_FNAME,
+            ).await?;
+
             while bytes < msg_len {
                 match written.write(&mut buf).await {
                     Ok(num_bytes) => bytes += num_bytes as u64,
@@ -344,6 +393,11 @@ impl SockWriter {
                     Err(e) => return Err(Box::new(e)),
                 } 
             }
+
+            debug_buf_to_file(
+                "finished write\n",
+                Self::DEBUG_FNAME,
+            ).await?;
 
             buf.clear();
         }
@@ -357,9 +411,16 @@ struct SockReader {
 }
 
 impl SockReader {
+    const DEBUG_FNAME: &str = "SockReader";
     pub async fn new(self) -> DynFutError<()> {
         let mut int_buf: Vec<u8> = Vec::new();
         loop {
+            debug_buf_to_file(
+                "Starting SockReader...\n",
+                Self::DEBUG_FNAME,
+            ).await?;
+
+
             let mut buf = self.buf.lock().await;
             let mut num_bytes = 0; 
 
@@ -383,6 +444,11 @@ impl SockReader {
                 }
             }
 
+            debug_buf_to_file(
+                "starting read...\n",
+                Self::DEBUG_FNAME,
+            ).await?;
+
             let mut block_count = 0u8;
             loop {
                 match self.read.try_read_buf(&mut int_buf) {
@@ -401,20 +467,58 @@ impl SockReader {
             buf.extend_from_slice(&int_buf[..num_bytes]);
             buf.truncate(num_bytes + HEADER_LEN);
 
-            #[cfg(debug_assertions)] 
-            debug_buf_to_file(&*buf.clone(), "sock_reader").await?;
+            debug_buf_to_file(
+                &*buf.clone(),
+                Self::DEBUG_FNAME,
+            ).await?;
         }
     }
 }
 
-pub struct SockStream {
-    sock: UnixListener,
-}
+const SOCK_VAR: &str = "SSH_AUTH_SOCK";
+
+pub struct SockStream(UnixStream);
 
 impl SockStream {
-    pub async fn get_auth_sock() -> DynError<SockStream> {
-        const SOCK_VAR: &str = "SSH_AUTH_SOCK";
+    pub async fn get_auth_stream() -> DynError<Self> {
+        let path = env::var(SOCK_VAR)?;
+        let sock = if std::fs::exists(&path)? {
+            wield_err!(UnixStream::connect(&path).await)
+        } else {
+            return Err(anyhow!(
+                "Error: the socket doesn't exist to connect to"
+            ).into());
+        };
 
+        return Ok(Self(sock));
+    }
+    
+    pub async fn handle_connections(
+        self,
+        initial_write_flag_state: bool,
+        std_written: impl AsyncWriteExt + Unpin + Send + 'static,
+        std_read: impl AsyncReadExt + Unpin + Send + 'static,
+    ) -> DynFutError<()> {
+        let (std_written, std_read) = (
+            Arc::new(Mutex::new(std_written)),
+            Arc::new(Mutex::new(std_read)),
+        );
+
+        SockStdInOutCon::spawn(
+            self.0,
+            initial_write_flag_state,
+            std_written,
+            std_read,
+        ).await?;
+
+        return Ok(());
+    }  
+}
+
+pub struct SockListener(UnixListener);
+
+impl SockListener {
+    pub async fn get_auth_sock() -> DynError<Self> {
         let path = env::var(SOCK_VAR)?;
         let sock = if std::fs::exists(&path)? {
             return Err(anyhow!(
@@ -424,11 +528,11 @@ impl SockStream {
             UnixListener::bind(&path)?
         };
 
-        return Ok(SockStream { sock })
+        return Ok(Self(sock))
     }
 
     pub async fn handle_connections(
-        &mut self,
+        &self,
         initial_write_flag_state: bool,
         std_written: impl AsyncWriteExt + Unpin + Send + 'static,
         std_read: impl AsyncReadExt + Unpin + Send + 'static,
@@ -439,9 +543,8 @@ impl SockStream {
         );
 
         loop {
-            let (stream, _) = wield_err!(self.accept().await);
             SockStdInOutCon::spawn(
-                stream, 
+                wield_err!(self.0.accept().await).0,
                 initial_write_flag_state,
                 std_written.clone(),
                 std_read.clone(),
@@ -450,20 +553,20 @@ impl SockStream {
     } 
 }
 
-impl Deref for SockStream {
+impl Deref for SockListener {
     type Target = UnixListener;
     fn deref(&self) -> &Self::Target {
-        return &self.sock;
+        return &self.0;
     }
 }
 
-impl DerefMut for SockStream {
+impl DerefMut for SockListener {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        return &mut self.sock;
+        return &mut self.0;
     }
 }
 
-impl Drop for SockStream {
+impl Drop for SockListener {
     fn drop(&mut self) {
         let addr = self.local_addr().unwrap();
         let Some(path) = addr.as_pathname() else {

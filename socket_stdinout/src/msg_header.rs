@@ -24,7 +24,13 @@ impl MsgHeader {
             }
         }
 
-        dbg!("MsgHeader::new constructed header", header, "\n\n");
+        dbg!(
+            "MsgHeader::new constructed header",
+            header,
+            "calculated length (Self::len)",
+            Self::len(&header),
+        );
+
         return Self(header);
     } 
 

@@ -11,8 +11,8 @@ async fn main() {
         io::stdout(),
     );
 
-    let mut listener = {
-        let res = sock::SockStream::get_auth_sock().await;
+    let listener = {
+        let res = sock::SockStream::get_auth_stream().await;
         log_err_append!(&res, sock::ERR_LOG_DIR_NAME);
         res.expect("Error: Failed sock::SockStream::get_auth_sock")
     };
