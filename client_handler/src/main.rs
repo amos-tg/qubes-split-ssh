@@ -2,19 +2,25 @@ mod qrexec;
 
 use crate::qrexec::QRExecProc;
 use tokio::process::{ChildStdin, ChildStdout}; 
-use log::log_err_append;
 use socket_stdinout::{
     self as sock,
-    DynError,
+    types::DynError,
+    debug::debug_err_append,
     ERR_LOG_DIR_NAME,
 };
 
 const INITIAL_STATE_W_FLAG: bool = true;
+const DEBUG_FNAME: &str = "Main";
+
 #[tokio::main]
 async fn main() {
     let qrexec = {
         let res = QRExecProc::new();
-        log_err_append!(&res, ERR_LOG_DIR_NAME);
+        debug_err_append(
+            &res,
+            DEBUG_FNAME,
+            ERR_LOG_DIR_NAME,
+        );
         res.expect("Error: Failed to get qrexec proc..")
     };
 
@@ -29,7 +35,11 @@ async fn main() {
 
     let stream = {
         let res = sock::SockListener::get_auth_sock().await;
-        log_err_append!(&res, ERR_LOG_DIR_NAME);
+        debug_err_append(
+            &res,
+            DEBUG_FNAME,
+            ERR_LOG_DIR_NAME,
+        );
         res.expect("Error: failed to get_auth_sock")
     };
 
@@ -39,6 +49,10 @@ async fn main() {
         qchild_stdout,
     ).await;
 
-    log_err_append!(&con_res, ERR_LOG_DIR_NAME);
+    debug_err_append(
+        &con_res,
+        DEBUG_FNAME,
+        ERR_LOG_DIR_NAME,
+    );
     con_res.expect("Error: handle_connections returned");
 }

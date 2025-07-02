@@ -67,7 +67,6 @@ name = "client_handler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "log",
  "socket_stdinout",
  "tokio",
 ]
@@ -93,10 +92,6 @@ dependencies = [
  "autocfg",
  "scopeguard",
 ]
-
-[[package]]
-name = "log"
-version = "0.1.0"
 
 [[package]]
 name = "memchr"
@@ -238,7 +233,6 @@ name = "socket_stdinout"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "log",
  "tokio",
 ]
 
@@ -293,7 +287,6 @@ name = "vault_handler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "log",
  "socket_stdinout",
  "tokio",
 ]

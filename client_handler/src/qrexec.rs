@@ -2,7 +2,7 @@ use crate::{
     DynError,
     ERR_LOG_DIR_NAME,
 };
-use log::log_err_append;
+use socket_stdinout::debug::debug_err_append;
 
 use std::{
     ops::{
@@ -20,6 +20,8 @@ use std::{
 };
 
 use anyhow::anyhow;
+
+const DEBUG_FNAME: &str = "Qrexec";
 
 #[derive(Debug)]
 pub struct DropChild(Child); 
@@ -67,7 +69,11 @@ impl QRExecProc {
     pub fn new() -> DynError<Self> { 
         let remote_vm = {
             let var = env::var(Self::VAULT_VM_NAME_ENV_VAR);
-            log_err_append!(&var, ERR_LOG_DIR_NAME);
+            debug_err_append(
+                &var,
+                DEBUG_FNAME,
+                ERR_LOG_DIR_NAME,
+            );
             var?
         };
 

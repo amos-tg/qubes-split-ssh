@@ -1,8 +1,12 @@
-use socket_stdinout as sock;
-use log::log_err_append;
+use socket_stdinout::{
+    self as sock,
+    ERR_LOG_DIR_NAME,
+    debug::debug_err_append,
+};
 use tokio::{self, io};
 
 pub const INITIAL_STATE_W_FLAG: bool = false;
+const DEBUG_FNAME: &str = "Main";
 
 #[tokio::main]
 async fn main() {
@@ -13,7 +17,11 @@ async fn main() {
 
     let listener = {
         let res = sock::SockStream::get_auth_stream().await;
-        log_err_append!(&res, sock::ERR_LOG_DIR_NAME);
+        debug_err_append(
+            &res,
+            DEBUG_FNAME,
+            ERR_LOG_DIR_NAME,
+        );
         res.expect("Error: Failed sock::SockStream::get_auth_sock")
     };
 
@@ -22,8 +30,13 @@ async fn main() {
         stdout, 
         stdin,
     ).await;
-    
-    log_err_append!(&con_res, sock::ERR_LOG_DIR_NAME);
+
+    debug_err_append(
+        &con_res,
+        DEBUG_FNAME,
+        ERR_LOG_DIR_NAME,
+    );
+
     con_res.expect("Error: handle_connections returned");
 }
 

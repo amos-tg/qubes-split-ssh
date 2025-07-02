@@ -1,5 +1,9 @@
 mod msg_header;
+pub mod debug;
+pub mod types;
 
+use types::{DynError, DynFutError};
+use debug::debug_append;
 use msg_header::{
     MsgHeader,
     HEADER_LEN,
@@ -7,7 +11,6 @@ use msg_header::{
 
 use std::{
     env,
-    error,
     time::Duration,
     ops::{Deref, DerefMut},
     io::ErrorKind::WouldBlock,
@@ -29,56 +32,20 @@ use tokio::{
         AsyncWriteExt,
     },
     time,
-    fs,
     sync::Mutex,
 };
 
 use anyhow::anyhow;
 
-pub type DynError<T> = Result<T, Box<dyn error::Error>>;
-pub type DynFutError<T> = Result<T, Box<dyn error::Error + 'static + Send>>;
-
-pub const ERR_LOG_DIR_NAME: &str = "split-ssh-sock-handler";
-
+pub const ERR_LOG_DIR_NAME: &str = "split-ssh";
 const SLEEP_TIME_MILLIS: u64 = 100; 
 const WRITABLE: bool = true; 
 const UNWRITABLE: bool = false;
 
-macro_rules! wield_err {
-    ($err:expr) => {
-        match $err {
-            Err(e) => return Err(Box::new(e)),
-            Ok(thing) => thing,
-        }
-    };
-}
+type TaskHandle = 
+    task::JoinHandle<Result<(), Box<dyn std::error::Error + Send>>>
+;
 
-#[cfg(debug_assertions)]
-async fn debug_buf_to_file(
-    buf: impl AsRef<[u8]>, 
-    fname: &str,
-) -> DynFutError<()> {
-    let dir = log::get_xdg_state_dir(ERR_LOG_DIR_NAME).expect(
-        "Debug fn debug_buf_to_file failed."
-    );
-
-    let path = format!(
-        "{}/{}.log",
-        dir, fname,
-    );
-
-
-    let contents = wield_err!(str::from_utf8(buf.as_ref()));
-
-    let _ = wield_err!(fs::write(&path, contents).await);
-
-    return Ok(());
-}
-
-/// forwards socket information from local VM 
-/// socket to remote VM socket over qrexec-client-vm, 
-/// Xen vchan when enabled by dom0 RPC policy.
-type TaskHandle = task::JoinHandle<Result<(), Box<dyn std::error::Error + Send>>>;
 pub struct SockStdInOutCon {
     fd_writer: TaskHandle,
     fd_reader: TaskHandle,
@@ -157,7 +124,6 @@ impl<'a> SockStdInOutCon {
                 self.fd_reader.abort(); 
                 self.sock_writer.abort();
                 self.sock_reader.abort();
-
                 wield_err!(self.fd_writer.await)?;
                 unreachable!("Error: fd_writer {HNDLER_ERR}");
             }
@@ -166,7 +132,6 @@ impl<'a> SockStdInOutCon {
                 self.fd_writer.abort();
                 self.sock_writer.abort();
                 self.sock_reader.abort();
-
                 wield_err!(self.fd_reader.await)?;
                 unreachable!("Error: fd_reader {HNDLER_ERR}");
             }
@@ -175,7 +140,6 @@ impl<'a> SockStdInOutCon {
                 self.fd_writer.abort();
                 self.fd_reader.abort();
                 self.sock_reader.abort();
-
                 wield_err!(self.sock_writer.await)?;
                 unreachable!("Error: sock_writer {HNDLER_ERR}");
             }
@@ -184,7 +148,6 @@ impl<'a> SockStdInOutCon {
                 self.fd_writer.abort();
                 self.fd_reader.abort();
                 self.sock_writer.abort();
-
                 wield_err!(self.sock_reader.await)?;
                 unreachable!("Error: sock_reader {HNDLER_ERR}");
             }
@@ -206,10 +169,11 @@ impl<U: AsyncWriteExt + Unpin> FdWriter<U> {
     const DEBUG_FNAME: &str = "FdWriter"; 
     pub async fn new(self) -> DynFutError<()> {
         loop {
-            debug_buf_to_file(
+            debug_append(
                 "Startup\n",
                 Self::DEBUG_FNAME,
-            ).await?;
+                ERR_LOG_DIR_NAME,
+            );
 
             loop {
                 match self.write_flag.load(SeqCst) { 
@@ -220,10 +184,11 @@ impl<U: AsyncWriteExt + Unpin> FdWriter<U> {
                 }
             }
 
-            debug_buf_to_file(
+            debug_append(
                 "Got WRITABLE flag state...\n",
                 Self::DEBUG_FNAME,
-            ).await?;
+                ERR_LOG_DIR_NAME,
+            );
 
             let mut buf;
             let mut buf_len;
@@ -262,10 +227,11 @@ impl<U: AsyncWriteExt + Unpin> FdWriter<U> {
             if let Err(e) = written.flush().await { return Err(Box::new(e)); }
             buf.clear();
 
-            debug_buf_to_file(
+            debug_append(
                 "Wrote everything...\n",
                 Self::DEBUG_FNAME,
-            ).await?;
+                ERR_LOG_DIR_NAME,
+            );
         }
     } 
 }
@@ -280,10 +246,11 @@ impl<T: AsyncReadExt + Unpin> FdReader<T> {
     const DEBUG_FNAME: &str = "FdReader";
     pub async fn new(self) -> DynFutError<()> {
         loop {
-            debug_buf_to_file(
+            debug_append(
                 "Startup...",
                 Self::DEBUG_FNAME,
-            ).await?;
+                ERR_LOG_DIR_NAME,
+            );
 
             let mut buf = self.buf.lock().await;
             if !buf.is_empty() { 
@@ -298,10 +265,11 @@ impl<T: AsyncReadExt + Unpin> FdReader<T> {
             let mut num_bytes = 0;
             let msg_len;
 
-            debug_buf_to_file(
+            debug_append(
                 "starting read...\n",
                 Self::DEBUG_FNAME,
-            ).await?;
+                ERR_LOG_DIR_NAME,
+            );
 
             loop {
                 match read.read(&mut buf).await {
@@ -318,10 +286,11 @@ impl<T: AsyncReadExt + Unpin> FdReader<T> {
             msg_len = MsgHeader::len(&buf[..8]);
             num_bytes -= 8;
 
-            debug_buf_to_file(
+            debug_append(
                 format!("Message length: {}\n", msg_len), 
                 Self::DEBUG_FNAME,
-            ).await?;
+                ERR_LOG_DIR_NAME,
+            );
 
             if num_bytes as u64 != msg_len {
                 loop {
@@ -339,13 +308,14 @@ impl<T: AsyncReadExt + Unpin> FdReader<T> {
 
             self.write_flag.store(WRITABLE, SeqCst);
 
-            debug_buf_to_file(
+            debug_append(
                 format!(
                     "What was read: {}\n",
                     wield_err!(str::from_utf8(&*buf.clone())),
                 ),
                 Self::DEBUG_FNAME,
-            ).await?;
+                ERR_LOG_DIR_NAME,
+            );
         }
     }
 }
@@ -359,10 +329,11 @@ impl SockWriter {
     const DEBUG_FNAME: &str = "SockWriter";
     pub async fn new(self) -> DynFutError<()> {
         loop {
-            debug_buf_to_file(
+            debug_append(
                 "starting...\n",
                 Self::DEBUG_FNAME,
-            ).await?;
+                ERR_LOG_DIR_NAME,
+            );
 
             let mut written = self.written.lock().await;
             let mut buf = self.buf.lock().await;
@@ -378,10 +349,11 @@ impl SockWriter {
             let mut bytes = 0;
             let msg_len = MsgHeader::len(&buf[..8]);
 
-            debug_buf_to_file(
+            debug_append(
                 format!("starting {} length write...\n", msg_len),
                 Self::DEBUG_FNAME,
-            ).await?;
+                ERR_LOG_DIR_NAME,
+            );
 
             while bytes < msg_len {
                 match written.write(&mut buf).await {
@@ -394,10 +366,11 @@ impl SockWriter {
                 } 
             }
 
-            debug_buf_to_file(
+            debug_append(
                 "finished write\n",
                 Self::DEBUG_FNAME,
-            ).await?;
+                ERR_LOG_DIR_NAME,
+            );
 
             buf.clear();
         }
@@ -415,10 +388,11 @@ impl SockReader {
     pub async fn new(self) -> DynFutError<()> {
         let mut int_buf: Vec<u8> = Vec::new();
         loop {
-            debug_buf_to_file(
+            debug_append(
                 "Starting SockReader...\n",
                 Self::DEBUG_FNAME,
-            ).await?;
+                ERR_LOG_DIR_NAME,
+            );
 
 
             let mut buf = self.buf.lock().await;
@@ -444,10 +418,11 @@ impl SockReader {
                 }
             }
 
-            debug_buf_to_file(
+            debug_append(
                 "starting read...\n",
                 Self::DEBUG_FNAME,
-            ).await?;
+                ERR_LOG_DIR_NAME,
+            );
 
             let mut block_count = 0u8;
             loop {
@@ -467,10 +442,11 @@ impl SockReader {
             buf.extend_from_slice(&int_buf[..num_bytes]);
             buf.truncate(num_bytes + HEADER_LEN);
 
-            debug_buf_to_file(
-                &*buf.clone(),
+            debug_append(
+                &*buf,
                 Self::DEBUG_FNAME,
-            ).await?;
+                ERR_LOG_DIR_NAME,
+            );
         }
     }
 }
