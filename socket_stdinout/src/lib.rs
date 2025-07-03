@@ -63,6 +63,10 @@ impl<'a> SockStdInOutCon {
         let write_flag = Arc::new(
             AtomicBool::new(initial_write_flag_state)
         );
+        
+        let timeout = Arc::new(
+            AtomicBool::new(false)
+        );
 
         let (read_half, write_half) = stream.into_split();
         let (read_half, write_half) = (
@@ -77,7 +81,7 @@ impl<'a> SockStdInOutCon {
             let sock_reader = SockReader {
                 read: read_half.clone(),
                 buf: sockr_fdw_buf.clone(),
-                write_flag: write_flag.clone(),
+                timeout: timeout.clone(),
             }.new();
             task::spawn(sock_reader)
         };
@@ -99,7 +103,6 @@ impl<'a> SockStdInOutCon {
             task::spawn(fd_reader)
         };
 
-
         let fd_writer = {
             let fd_writer = FdWriter {
                 written: std_written.clone(),
@@ -114,12 +117,21 @@ impl<'a> SockStdInOutCon {
             fd_reader,
             sock_writer,
             sock_reader,
-        }.handler().await;
+        }.handler(timeout).await;
     }
 
-    async fn handler(self) -> DynFutError<()> {
+    async fn handler(self, timeout: Arc<AtomicBool>) -> DynFutError<()> {
         const HNDLER_ERR: &str = "finished with an impossible return val.";
+        // you should make this an argument to the program so people with diff. requirements
+        // can use it with a bigger timeout. 
+        const T_OUT_MAX: u8 = 100;
+        let mut t_out_counter = 0u8;
         loop { 
+            match timeout.load(SeqCst) { 
+                SockReader::ACTIVE => t_out_counter = 0,
+                SockReader::INACTIVE => t_out_counter += 1,
+            }
+
             if self.fd_writer.is_finished() { 
                 self.fd_reader.abort(); 
                 self.sock_writer.abort();
@@ -150,6 +162,10 @@ impl<'a> SockStdInOutCon {
                 self.sock_writer.abort();
                 wield_err!(self.sock_reader.await)?;
                 unreachable!("Error: sock_reader {HNDLER_ERR}");
+            }
+
+            if t_out_counter == T_OUT_MAX {
+                break Ok(());
             }
 
             time::sleep(
@@ -346,8 +362,8 @@ impl SockWriter {
                 continue;
             }
 
-            let mut bytes = 0;
-            let msg_len = MsgHeader::len(&buf[..8]);
+            let mut bytes = 0usize;
+            let msg_len = MsgHeader::len(&buf[..8]) as usize;
 
             debug_append(
                 format!("starting {} length write...\n", msg_len),
@@ -356,8 +372,8 @@ impl SockWriter {
             );
 
             while bytes < msg_len {
-                match written.write(&mut buf).await {
-                    Ok(num_bytes) => bytes += num_bytes as u64,
+                match written.write(&mut buf[bytes..msg_len]).await {
+                    Ok(num_bytes) => bytes += num_bytes,
                     Err(ref e) if e.kind() == WouldBlock => {
                         time::sleep(Duration::from_millis(SLEEP_TIME_MILLIS)).await;
                         continue;
@@ -380,23 +396,23 @@ impl SockWriter {
 struct SockReader {
     read: Arc<OwnedReadHalf>,
     buf: Arc<Mutex<Vec<u8>>>,
-    write_flag: Arc<AtomicBool>,
+    timeout: Arc<AtomicBool>,
 }
 
 impl SockReader {
+    const ACTIVE: bool = true;
+    const INACTIVE: bool = false;
     const DEBUG_FNAME: &str = "SockReader";
     pub async fn new(self) -> DynFutError<()> {
         let mut int_buf: Vec<u8> = Vec::new();
         loop {
             debug_append(
-                "Starting SockReader...\n",
+                "Starting SockReader iteration...\n",
                 Self::DEBUG_FNAME,
                 ERR_LOG_DIR_NAME,
             );
 
-
             let mut buf = self.buf.lock().await;
-            let mut num_bytes = 0; 
 
             if !buf.is_empty() { 
                 drop(buf);
@@ -406,41 +422,36 @@ impl SockReader {
                 continue; 
             }
 
-            loop {
-                match self.write_flag.load(SeqCst) {
-                    WRITABLE => break, 
-                    UNWRITABLE => {
-                        time::sleep(
-                            Duration::from_millis(SLEEP_TIME_MILLIS)
-                        ).await;
-                        continue;   
-                    }
-                }
-            }
-
             debug_append(
                 "starting read...\n",
                 Self::DEBUG_FNAME,
                 ERR_LOG_DIR_NAME,
             );
 
-            let mut block_count = 0u8;
+            let mut cursor = 0usize;
             loop {
-                match self.read.try_read_buf(&mut int_buf) {
-                    Ok(num_read) => num_bytes += num_read,
-                    Err(ref e) if e.kind() == WouldBlock => {
-                        block_count += 1;
-                        if block_count == 3 {
+                wield_err!(self.read.readable().await);
+                match self.read.try_read(&mut int_buf[cursor..]) {
+                    Ok(num_read) => {
+                        if num_read == 0 {
+                            self.timeout.store(Self::INACTIVE, SeqCst);
                             break;
+                        } else { 
+                            self.timeout.store(Self::ACTIVE, SeqCst);
+                            cursor += num_read;
                         }
                     }
+
+                    Err(ref e) if e.kind() == WouldBlock => continue,
                     Err(e) => return Err(Box::new(e)),
                 };
             }
 
-            buf.extend_from_slice(&MsgHeader::new(int_buf.len() as u64).0);
-            buf.extend_from_slice(&int_buf[..num_bytes]);
-            buf.truncate(num_bytes + HEADER_LEN);
+            buf.extend_from_slice(
+                &MsgHeader::new(int_buf.len() as u64).0
+            );
+            buf.extend_from_slice(&int_buf[..cursor]);
+            buf.truncate(cursor + HEADER_LEN);
 
             debug_append(
                 &*buf,
