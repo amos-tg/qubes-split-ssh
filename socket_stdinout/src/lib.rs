@@ -39,8 +39,6 @@ use anyhow::anyhow;
 
 pub const ERR_LOG_DIR_NAME: &str = "split-ssh";
 const SLEEP_TIME_MILLIS: u64 = 100; 
-const WRITABLE: bool = true; 
-const UNWRITABLE: bool = false;
 
 type TaskHandle = 
     task::JoinHandle<Result<(), Box<dyn std::error::Error + Send>>>
@@ -56,14 +54,9 @@ pub struct SockStdInOutCon {
 impl<'a> SockStdInOutCon {
     pub async fn spawn(
         stream: UnixStream,
-        initial_write_flag_state: bool,
         std_written: Arc<Mutex<impl AsyncWriteExt + Unpin + Send + 'static>>,
         std_read: Arc<Mutex<impl AsyncReadExt + Unpin + Send + 'static>>,
     ) -> DynFutError<()> {
-        let write_flag = Arc::new(
-            AtomicBool::new(initial_write_flag_state)
-        );
-        
         let timeout = Arc::new(
             AtomicBool::new(false)
         );
@@ -98,7 +91,6 @@ impl<'a> SockStdInOutCon {
             let fd_reader = FdReader {
                 read: std_read.clone(),
                 buf: sockw_fdr_buf.clone(),
-                write_flag: write_flag.clone(),
             }.new();
             task::spawn(fd_reader)
         };
@@ -107,7 +99,6 @@ impl<'a> SockStdInOutCon {
             let fd_writer = FdWriter {
                 written: std_written.clone(),
                 buf: sockr_fdw_buf.clone(),
-                write_flag: write_flag.clone(),
             }.new();
             task::spawn(fd_writer)
         };
@@ -178,7 +169,6 @@ impl<'a> SockStdInOutCon {
 struct FdWriter<U: AsyncWriteExt + Unpin> {
     written: Arc<Mutex<U>>,
     buf: Arc<Mutex<Vec<u8>>>,
-    write_flag: Arc<AtomicBool>,
 }
 
 impl<U: AsyncWriteExt + Unpin> FdWriter<U> {
@@ -190,15 +180,6 @@ impl<U: AsyncWriteExt + Unpin> FdWriter<U> {
                 Self::DEBUG_FNAME,
                 ERR_LOG_DIR_NAME,
             );
-
-            loop {
-                match self.write_flag.load(SeqCst) { 
-                    WRITABLE => break,
-                    UNWRITABLE => time::sleep(
-                        Duration::from_millis(SLEEP_TIME_MILLIS)
-                    ).await,
-                }
-            }
 
             debug_append(
                 "Got WRITABLE flag state...\n",
@@ -238,8 +219,6 @@ impl<U: AsyncWriteExt + Unpin> FdWriter<U> {
                 }
             }
 
-            self.write_flag.store(UNWRITABLE, SeqCst);
-
             if let Err(e) = written.flush().await { return Err(Box::new(e)); }
             buf.clear();
 
@@ -255,7 +234,6 @@ impl<U: AsyncWriteExt + Unpin> FdWriter<U> {
 struct FdReader<T: AsyncReadExt + Unpin> {
     read: Arc<Mutex<T>>, 
     buf: Arc<Mutex<Vec<u8>>>,
-    write_flag: Arc<AtomicBool>,
 }
 
 impl<T: AsyncReadExt + Unpin> FdReader<T> {
@@ -321,8 +299,6 @@ impl<T: AsyncReadExt + Unpin> FdReader<T> {
                     }
                 }
             }
-
-            self.write_flag.store(WRITABLE, SeqCst);
 
             debug_append(
                 format!(
@@ -482,7 +458,6 @@ impl SockStream {
     
     pub async fn handle_connections(
         self,
-        initial_write_flag_state: bool,
         std_written: impl AsyncWriteExt + Unpin + Send + 'static,
         std_read: impl AsyncReadExt + Unpin + Send + 'static,
     ) -> DynFutError<()> {
@@ -493,7 +468,6 @@ impl SockStream {
 
         SockStdInOutCon::spawn(
             self.0,
-            initial_write_flag_state,
             std_written,
             std_read,
         ).await?;
@@ -520,7 +494,6 @@ impl SockListener {
 
     pub async fn handle_connections(
         &self,
-        initial_write_flag_state: bool,
         std_written: impl AsyncWriteExt + Unpin + Send + 'static,
         std_read: impl AsyncReadExt + Unpin + Send + 'static,
     ) -> DynFutError<()> {
@@ -532,7 +505,6 @@ impl SockListener {
         loop {
             SockStdInOutCon::spawn(
                 wield_err!(self.0.accept().await).0,
-                initial_write_flag_state,
                 std_written.clone(),
                 std_read.clone(),
             ).await?;

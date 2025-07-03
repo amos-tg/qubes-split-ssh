@@ -5,7 +5,6 @@ use socket_stdinout::{
 };
 use tokio::{self, io};
 
-pub const INITIAL_STATE_W_FLAG: bool = false;
 const DEBUG_FNAME: &str = "Main";
 
 #[tokio::main]
@@ -26,7 +25,6 @@ async fn main() {
     };
 
     let con_res = listener.handle_connections(
-        INITIAL_STATE_W_FLAG,
         stdout, 
         stdin,
     ).await;

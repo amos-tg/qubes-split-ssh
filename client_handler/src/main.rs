@@ -9,7 +9,6 @@ use socket_stdinout::{
     ERR_LOG_DIR_NAME,
 };
 
-const INITIAL_STATE_W_FLAG: bool = true;
 const DEBUG_FNAME: &str = "Main";
 
 #[tokio::main]
@@ -44,7 +43,6 @@ async fn main() {
     };
 
     let con_res = stream.handle_connections(
-        crate::INITIAL_STATE_W_FLAG,
         qchild_stdin,
         qchild_stdout,
     ).await;
