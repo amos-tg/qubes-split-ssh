@@ -176,13 +176,7 @@ impl<U: AsyncWriteExt + Unpin> FdWriter<U> {
     pub async fn new(self) -> DynFutError<()> {
         loop {
             debug_append(
-                "Startup\n",
-                Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME,
-            );
-
-            debug_append(
-                "Got WRITABLE flag state...\n",
+                "Starting iteration... \n",
                 Self::DEBUG_FNAME,
                 ERR_LOG_DIR_NAME,
             );
@@ -203,9 +197,14 @@ impl<U: AsyncWriteExt + Unpin> FdWriter<U> {
                 }
             }
 
+            debug_append(
+                "got a buffer with content, starting write...\n", 
+                Self::DEBUG_FNAME,
+                ERR_LOG_DIR_NAME,
+            );
+
             let mut written = self.written.lock().await;
             let mut bytes = 0;
-
             while bytes < buf_len {
                 match written.write(&buf[bytes..]).await {
                     Ok(n_bytes) => bytes += n_bytes,
@@ -219,11 +218,12 @@ impl<U: AsyncWriteExt + Unpin> FdWriter<U> {
                 }
             }
 
-            if let Err(e) = written.flush().await { return Err(Box::new(e)); }
+            wield_err!(written.flush().await);
+
             buf.clear();
 
             debug_append(
-                "Wrote everything...\n",
+                "Wrote everything from buf...\n",
                 Self::DEBUG_FNAME,
                 ERR_LOG_DIR_NAME,
             );
@@ -241,7 +241,7 @@ impl<T: AsyncReadExt + Unpin> FdReader<T> {
     pub async fn new(self) -> DynFutError<()> {
         loop {
             debug_append(
-                "Startup...",
+                "Starting iteration...\n",
                 Self::DEBUG_FNAME,
                 ERR_LOG_DIR_NAME,
             );
@@ -266,10 +266,15 @@ impl<T: AsyncReadExt + Unpin> FdReader<T> {
             );
 
             loop {
-                match read.read(&mut buf).await {
-                    Ok(bytes) => num_bytes += bytes, 
+                match read.read(&mut buf[num_bytes..]).await {
+                    Ok(bytes) => {
+                        num_bytes += bytes; 
+                        if num_bytes >= HEADER_LEN {
+                            break;
+                        }
+                    }
                     Err(ref e) if e.kind() == WouldBlock => { 
-                        if num_bytes >= 8 {
+                        if num_bytes >= HEADER_LEN {
                             break;
                         }
                     }
@@ -277,7 +282,10 @@ impl<T: AsyncReadExt + Unpin> FdReader<T> {
                 }
             }
 
-            msg_len = MsgHeader::len(&buf[..8]);
+            let mut header_cln: [u8; 8] = [0u8; 8];
+            header_cln.clone_from_slice(&buf[..8]);
+
+            msg_len = MsgHeader::len(header_cln);
             num_bytes -= 8;
 
             debug_append(
@@ -322,7 +330,7 @@ impl SockWriter {
     pub async fn new(self) -> DynFutError<()> {
         loop {
             debug_append(
-                "starting...\n",
+                "starting iteration...\n",
                 Self::DEBUG_FNAME,
                 ERR_LOG_DIR_NAME,
             );
@@ -339,7 +347,9 @@ impl SockWriter {
             }
 
             let mut bytes = 0usize;
-            let msg_len = MsgHeader::len(&buf[..8]) as usize;
+            let mut header_cln = [0u8; 8];
+            header_cln.clone_from_slice(&buf[..8]);
+            let msg_len = MsgHeader::len(header_cln) as usize;
 
             debug_append(
                 format!("starting {} length write...\n", msg_len),
@@ -430,7 +440,12 @@ impl SockReader {
             buf.truncate(cursor + HEADER_LEN);
 
             debug_append(
-                &*buf,
+                &format!(
+                    "{} <- Read buffer\n",
+                    wield_err!(
+                        str::from_utf8(&buf)
+                    ),
+                ),
                 Self::DEBUG_FNAME,
                 ERR_LOG_DIR_NAME,
             );
