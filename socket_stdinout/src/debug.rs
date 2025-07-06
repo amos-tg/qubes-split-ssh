@@ -75,7 +75,7 @@ pub fn debug_err_append<'a, T, E: std::fmt::Display>(
     fname: &str,
     dir_name: &str,
 ) {
-    if let Err(_err) = error {
+    if let Err(err) = error {
         let dir = get_xdg_state_dir(dir_name)
             .expect("Error: debug_err_append, xdg_dir")
         ;
@@ -97,7 +97,7 @@ pub fn debug_err_append<'a, T, E: std::fmt::Display>(
             .expect("Error: debug_err_append, file open")
         ;
 
-        let err_msg = stringify!(err);
+        let err_msg = err.to_string();
         let _ = &mut file.write_all(
             err_msg.as_ref()
         ).expect("Error: debug_err_append, write_fmt");

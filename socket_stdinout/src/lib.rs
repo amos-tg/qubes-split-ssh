@@ -118,6 +118,23 @@ impl<'a> SockStdInOutCon {
         const T_OUT_MAX: u8 = 100;
         let mut t_out_counter = 0u8;
         loop { 
+            macro_rules! taskerr {
+                ($err:expr, $task:literal) => {
+                    match $err {
+                        Err(e) => {
+                            return Err(anyhow!(
+                                format!(
+                                    "Error: task={} : {}",
+                                    $task,
+                                    e.to_string()
+                                )
+                            ).into())
+                        },
+                        Ok(thing) => thing,
+                    }
+                }
+            }
+
             match timeout.load(SeqCst) { 
                 SockReader::ACTIVE => t_out_counter = 0,
                 SockReader::INACTIVE => t_out_counter += 1,
@@ -127,7 +144,10 @@ impl<'a> SockStdInOutCon {
                 self.fd_reader.abort(); 
                 self.sock_writer.abort();
                 self.sock_reader.abort();
-                wield_err!(self.fd_writer.await)?;
+                taskerr!(
+                    wield_err!(self.fd_writer.await),
+                    "FdWriter"
+                );
                 unreachable!("Error: fd_writer {HNDLER_ERR}");
             }
 
@@ -135,7 +155,10 @@ impl<'a> SockStdInOutCon {
                 self.fd_writer.abort();
                 self.sock_writer.abort();
                 self.sock_reader.abort();
-                wield_err!(self.fd_reader.await)?;
+                taskerr!(
+                    wield_err!(self.fd_reader.await),
+                    "FdReader"
+                );
                 unreachable!("Error: fd_reader {HNDLER_ERR}");
             }
 
@@ -143,7 +166,10 @@ impl<'a> SockStdInOutCon {
                 self.fd_writer.abort();
                 self.fd_reader.abort();
                 self.sock_reader.abort();
-                wield_err!(self.sock_writer.await)?;
+                taskerr!(
+                    wield_err!(self.sock_writer.await),
+                    "SockWriter"
+                );
                 unreachable!("Error: sock_writer {HNDLER_ERR}");
             }
 
@@ -151,7 +177,10 @@ impl<'a> SockStdInOutCon {
                 self.fd_writer.abort();
                 self.fd_reader.abort();
                 self.sock_writer.abort();
-                wield_err!(self.sock_reader.await)?;
+                taskerr!(
+                    wield_err!(self.sock_reader.await),
+                    "SockReader"
+                );
                 unreachable!("Error: sock_reader {HNDLER_ERR}");
             }
 
@@ -433,9 +462,12 @@ impl SockReader {
                 };
             }
 
-            buf.extend_from_slice(
-                &MsgHeader::new(int_buf.len() as u64).0
-            );
+            let buf_len = int_buf.len() as u64; 
+            if buf_len == 0 {
+                continue;
+            }
+
+            buf.extend_from_slice(&MsgHeader::new(buf_len).0);
             buf.extend_from_slice(&int_buf[..cursor]);
             buf.truncate(cursor + HEADER_LEN);
 
