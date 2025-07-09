@@ -10,29 +10,18 @@ use msg_header::{
 };
 
 use std::{
+    fs,
     env,
     time::Duration,
     ops::{Deref, DerefMut},
-    io::ErrorKind::WouldBlock,
+    io::{Read, Write},
     sync::{
         atomic::{AtomicBool, Ordering::*},
         Arc,
+        Mutex,
     },
-};
-
-use tokio::{
-    task,
-    net::{
-        UnixListener,
-        UnixStream, 
-        unix::{OwnedReadHalf, OwnedWriteHalf},
-    },
-    io::{
-        AsyncReadExt,
-        AsyncWriteExt,
-    },
-    time,
-    sync::Mutex,
+    os::unix::net::{UnixListener, UnixStream},
+    thread::JoinHandle,
 };
 
 use anyhow::anyhow;
@@ -40,22 +29,22 @@ use anyhow::anyhow;
 pub const ERR_LOG_DIR_NAME: &str = "split-ssh";
 const SLEEP_TIME_MILLIS: u64 = 100; 
 
-type TaskHandle = 
-    task::JoinHandle<Result<(), Box<dyn std::error::Error + Send>>>
+type Thread = 
+    JoinHandle<Result<(), Box<dyn std::error::Error + Send>>>
 ;
 
 pub struct SockStdInOutCon {
-    fd_writer: TaskHandle,
-    fd_reader: TaskHandle,
-    sock_writer: TaskHandle,
-    sock_reader: TaskHandle,
+    fd_writer: Thread,
+    fd_reader: Thread,
+    sock_writer: Thread,
+    sock_reader: Thread,
 }
 
 impl<'a> SockStdInOutCon {
     pub async fn spawn(
         stream: UnixStream,
-        std_written: Arc<Mutex<impl AsyncWriteExt + Unpin + Send + 'static>>,
-        std_read: Arc<Mutex<impl AsyncReadExt + Unpin + Send + 'static>>,
+        std_written: Arc<Mutex<Write>>,
+        std_read: Arc<Mutex<Read>>,
     ) -> DynFutError<()> {
         let timeout = Arc::new(
             AtomicBool::new(false)
@@ -191,6 +180,83 @@ impl<'a> SockStdInOutCon {
             time::sleep(
                 Duration::from_millis(SLEEP_TIME_MILLIS)
             ).await;
+        }
+    }
+}
+
+struct SockReader {
+    read: Arc<OwnedReadHalf>,
+    buf: Arc<Mutex<Vec<u8>>>,
+    timeout: Arc<AtomicBool>,
+}
+
+impl SockReader {
+    const ACTIVE: bool = true;
+    const INACTIVE: bool = false;
+    const DEBUG_FNAME: &str = "SockReader";
+    pub async fn new(self) -> DynFutError<()> {
+        let mut int_buf: Vec<u8> = Vec::new();
+        loop {
+            debug_append(
+                "Starting SockReader iteration...\n",
+                Self::DEBUG_FNAME,
+                ERR_LOG_DIR_NAME,
+            );
+
+            let mut buf = self.buf.lock().await;
+
+            if !buf.is_empty() { 
+                drop(buf);
+                time::sleep(
+                    Duration::from_millis(SLEEP_TIME_MILLIS)
+                ).await;
+                continue; 
+            }
+
+            debug_append(
+                "starting read...\n",
+                Self::DEBUG_FNAME,
+                ERR_LOG_DIR_NAME,
+            );
+
+            let mut cursor = 0usize;
+            loop {
+                wield_err!(self.read.readable().await);
+                match self.read.try_read(&mut int_buf[cursor..]) {
+                    Ok(num_read) => {
+                        if num_read == 0 {
+                            self.timeout.store(Self::INACTIVE, SeqCst);
+                            break;
+                        } else { 
+                            self.timeout.store(Self::ACTIVE, SeqCst);
+                            cursor += num_read;
+                        }
+                    }
+
+                    Err(ref e) if e.kind() == WouldBlock => continue,
+                    Err(e) => return Err(Box::new(e)),
+                };
+            }
+
+            let buf_len = int_buf.len() as u64; 
+            if buf_len == 0 {
+                continue;
+            }
+
+            buf.extend_from_slice(&MsgHeader::new(buf_len).0);
+            buf.extend_from_slice(&int_buf[..cursor]);
+            buf.truncate(cursor + HEADER_LEN);
+
+            debug_append(
+                &format!(
+                    "{} <- Read buffer\n",
+                    wield_err!(
+                        str::from_utf8(&buf)
+                    ),
+                ),
+                Self::DEBUG_FNAME,
+                ERR_LOG_DIR_NAME,
+            );
         }
     }
 }
@@ -408,92 +474,16 @@ impl SockWriter {
     }
 }
 
-struct SockReader {
-    read: Arc<OwnedReadHalf>,
-    buf: Arc<Mutex<Vec<u8>>>,
-    timeout: Arc<AtomicBool>,
-}
-
-impl SockReader {
-    const ACTIVE: bool = true;
-    const INACTIVE: bool = false;
-    const DEBUG_FNAME: &str = "SockReader";
-    pub async fn new(self) -> DynFutError<()> {
-        let mut int_buf: Vec<u8> = Vec::new();
-        loop {
-            debug_append(
-                "Starting SockReader iteration...\n",
-                Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME,
-            );
-
-            let mut buf = self.buf.lock().await;
-
-            if !buf.is_empty() { 
-                drop(buf);
-                time::sleep(
-                    Duration::from_millis(SLEEP_TIME_MILLIS)
-                ).await;
-                continue; 
-            }
-
-            debug_append(
-                "starting read...\n",
-                Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME,
-            );
-
-            let mut cursor = 0usize;
-            loop {
-                wield_err!(self.read.readable().await);
-                match self.read.try_read(&mut int_buf[cursor..]) {
-                    Ok(num_read) => {
-                        if num_read == 0 {
-                            self.timeout.store(Self::INACTIVE, SeqCst);
-                            break;
-                        } else { 
-                            self.timeout.store(Self::ACTIVE, SeqCst);
-                            cursor += num_read;
-                        }
-                    }
-
-                    Err(ref e) if e.kind() == WouldBlock => continue,
-                    Err(e) => return Err(Box::new(e)),
-                };
-            }
-
-            let buf_len = int_buf.len() as u64; 
-            if buf_len == 0 {
-                continue;
-            }
-
-            buf.extend_from_slice(&MsgHeader::new(buf_len).0);
-            buf.extend_from_slice(&int_buf[..cursor]);
-            buf.truncate(cursor + HEADER_LEN);
-
-            debug_append(
-                &format!(
-                    "{} <- Read buffer\n",
-                    wield_err!(
-                        str::from_utf8(&buf)
-                    ),
-                ),
-                Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME,
-            );
-        }
-    }
-}
 
 const SOCK_VAR: &str = "SSH_AUTH_SOCK";
 
 pub struct SockStream(UnixStream);
 
 impl SockStream {
-    pub async fn get_auth_stream() -> DynError<Self> {
+    pub fn get_auth_stream() -> DynError<Self> {
         let path = env::var(SOCK_VAR)?;
         let sock = if std::fs::exists(&path)? {
-            wield_err!(UnixStream::connect(&path).await)
+            UnixStream::connect(&path)?
         } else {
             return Err(anyhow!(
                 "Error: the socket doesn't exist to connect to"
@@ -503,10 +493,10 @@ impl SockStream {
         return Ok(Self(sock));
     }
     
-    pub async fn handle_connections(
+    pub fn handle_connections(
         self,
-        std_written: impl AsyncWriteExt + Unpin + Send + 'static,
-        std_read: impl AsyncReadExt + Unpin + Send + 'static,
+        std_written: Write + Send,
+        std_read: Read + Send,
     ) -> DynFutError<()> {
         let (std_written, std_read) = (
             Arc::new(Mutex::new(std_written)),
@@ -517,7 +507,7 @@ impl SockStream {
             self.0,
             std_written,
             std_read,
-        ).await?;
+        )?;
 
         return Ok(());
     }  
@@ -536,13 +526,17 @@ impl SockListener {
             UnixListener::bind(&path)?
         };
 
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o777);
+        fs::set_permissions(&path, perms)?;
+
         return Ok(Self(sock))
     }
 
     pub async fn handle_connections(
         &self,
-        std_written: impl AsyncWriteExt + Unpin + Send + 'static,
-        std_read: impl AsyncReadExt + Unpin + Send + 'static,
+        std_written: Write + Send,
+        std_read: Read + Send,
     ) -> DynFutError<()> {
         let (std_written, std_read) = (
             Arc::new(Mutex::new(std_written)),
@@ -554,7 +548,7 @@ impl SockListener {
                 wield_err!(self.0.accept().await).0,
                 std_written.clone(),
                 std_read.clone(),
-            ).await?;
+            )?;
         }
     } 
 }
@@ -574,13 +568,20 @@ impl DerefMut for SockListener {
 
 impl Drop for SockListener {
     fn drop(&mut self) {
-        let addr = self.local_addr().unwrap();
+        let Ok(addr) = self.local_addr() else {
+            return;
+        };
+
         let Some(path) = addr.as_pathname() else {
             return;
         };
 
-        if std::fs::exists(&path).unwrap() {
-            std::fs::remove_file(path).unwrap(); 
+        let Ok(fstat) = std::fs::exists(&path) else {
+            return;
+        };
+
+        if fstat {
+            let _ = std::fs::remove_file(path); 
         }
     } 
 }
