@@ -12,12 +12,13 @@ use msg_header::{
 use std::{
     env,
     time::Duration,
-    ops::{Deref, DerefMut},
     io::ErrorKind::WouldBlock,
     sync::{
         atomic::{AtomicBool, Ordering::*},
         Arc,
     },
+    os::unix::prelude::PermissionsExt,
+    fs,
 };
 
 use tokio::{
@@ -113,8 +114,6 @@ impl<'a> SockStdInOutCon {
 
     async fn handler(self, timeout: Arc<AtomicBool>) -> DynFutError<()> {
         const HNDLER_ERR: &str = "finished with an impossible return val.";
-        // you should make this an argument to the program so people with diff. requirements
-        // can use it with a bigger timeout. 
         const T_OUT_MAX: u8 = 100;
         let mut t_out_counter = 0u8;
         loop { 
@@ -462,12 +461,13 @@ impl SockReader {
                 };
             }
 
-            let buf_len = int_buf.len() as u64; 
-            if buf_len == 0 {
+            if cursor == 0 {
                 continue;
             }
 
-            buf.extend_from_slice(&MsgHeader::new(buf_len).0);
+            buf.extend_from_slice(
+                &MsgHeader::new(cursor as u64).0
+            );
             buf.extend_from_slice(&int_buf[..cursor]);
             buf.truncate(cursor + HEADER_LEN);
 
@@ -490,7 +490,7 @@ const SOCK_VAR: &str = "SSH_AUTH_SOCK";
 pub struct SockStream(UnixStream);
 
 impl SockStream {
-    pub async fn get_auth_stream() -> DynError<Self> {
+    pub async fn new() -> DynError<Self> {
         let path = env::var(SOCK_VAR)?;
         let sock = if std::fs::exists(&path)? {
             wield_err!(UnixStream::connect(&path).await)
@@ -526,15 +526,19 @@ impl SockStream {
 pub struct SockListener(UnixListener);
 
 impl SockListener {
-    pub async fn get_auth_sock() -> DynError<Self> {
+    pub fn new() -> DynError<Self> {
         let path = env::var(SOCK_VAR)?;
         let sock = if std::fs::exists(&path)? {
             return Err(anyhow!(
-                "Error: The auth sock is already bound."
+                "Error: The auth sock is already bound"
             ).into())
         } else {
             UnixListener::bind(&path)?
         };
+
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o777);
+        fs::set_permissions(&path, perms)?;
 
         return Ok(Self(sock))
     }
@@ -559,22 +563,9 @@ impl SockListener {
     } 
 }
 
-impl Deref for SockListener {
-    type Target = UnixListener;
-    fn deref(&self) -> &Self::Target {
-        return &self.0;
-    }
-}
-
-impl DerefMut for SockListener {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        return &mut self.0;
-    }
-}
-
 impl Drop for SockListener {
     fn drop(&mut self) {
-        let addr = self.local_addr().unwrap();
+        let addr = self.0.local_addr().unwrap();
         let Some(path) = addr.as_pathname() else {
             return;
         };

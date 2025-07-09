@@ -1,7 +1,6 @@
 mod qrexec;
 
 use crate::qrexec::QRExecProc;
-use tokio::process::{ChildStdin, ChildStdout}; 
 use socket_stdinout::{
     self as sock,
     types::DynError,
@@ -23,17 +22,8 @@ async fn main() {
         res.expect("Error: Failed to get qrexec proc..")
     };
 
-    let (qchild_stdin, qchild_stdout) = (
-        ChildStdin::from_std(qrexec.stdin).expect(
-            "Error: Failed to produce async qrexec stdin."
-        ),
-        ChildStdout::from_std(qrexec.stdout).expect(
-            "Error: Failed to produce async qrexec stdout."
-        ),
-    );
-
     let stream = {
-        let res = sock::SockListener::get_auth_sock().await;
+        let res = sock::SockListener::new();
         debug_err_append(
             &res,
             DEBUG_FNAME,
@@ -43,8 +33,8 @@ async fn main() {
     };
 
     let con_res = stream.handle_connections(
-        qchild_stdin,
-        qchild_stdout,
+        qrexec.stdin,
+        qrexec.stdout,
     ).await;
 
     debug_err_append(

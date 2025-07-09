@@ -15,7 +15,7 @@ async fn main() {
     );
 
     let listener = {
-        let res = sock::SockStream::get_auth_stream().await;
+        let res = sock::SockStream::new().await;
         debug_err_append(
             &res,
             DEBUG_FNAME,

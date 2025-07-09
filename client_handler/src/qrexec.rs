@@ -3,65 +3,25 @@ use crate::{
     ERR_LOG_DIR_NAME,
 };
 use socket_stdinout::debug::debug_err_append;
-
 use std::{
-    ops::{
-        Deref,
-        DerefMut,
-    },
     env,
-    process::{
-        Stdio,
-        Child,
-        ChildStdout,
-        ChildStdin,
-        Command,
-    },
+    process::Stdio,
 };
-
 use anyhow::anyhow;
+use tokio::process::{
+    Child,
+    ChildStdout,
+    ChildStdin,
+    Command,
+};
 
 const DEBUG_FNAME: &str = "Qrexec";
 
-#[derive(Debug)]
-pub struct DropChild(Child); 
-
-impl Drop for DropChild {
-    fn drop(&mut self) {
-        let id = self.0.id(); 
-        self.0.kill().expect(
-            &format!(
-                "Error failed to kill qrexec-client-vm during cleanup drop \
-                execution: PID for manual kill = {}",
-                id,
-            )
-        );
-    }
-}
-
-impl Deref for DropChild {
-    type Target = Child;
-    fn deref(&self) -> &Self::Target {
-        &self.0 
-    }
-}
-
-impl DerefMut for DropChild {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-#[derive(Debug)]
-pub struct QRExecProc {
-    _child: DropChild,
+#[derive(Debug)] pub struct QRExecProc {
+    _child: Child,
     pub stdin: ChildStdin,
     pub stdout: ChildStdout,
 }
-
-// I am aware that qrexec-client-vm takes a local program argument
-// unfortunately rust does not impl io::Write for io::Stdin, but it 
-// does for process::ChildStdin. 
 
 impl QRExecProc {
     const VAULT_VM_NAME_ENV_VAR: &str = "SSH_VAULT_VM";
@@ -77,7 +37,7 @@ impl QRExecProc {
             var?
         };
 
-        let mut child = DropChild(Command::new("qrexec-client-vm")
+        let mut child = Command::new("qrexec-client-vm")
             .args([
                 &remote_vm, 
                 Self::RPC_SERVICE_NAME,
@@ -85,20 +45,17 @@ impl QRExecProc {
             .stdin(Stdio::piped()) 
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()?
-        );
+        ;
 
-        let stdin = child.stdin.take().ok_or(
-            anyhow!(
-                "Error: failed to produce a stdin for qrexec child proc."
-            )
-        )?;
+        let stdin = child.stdin.take().ok_or(anyhow!(
+            "Error: failed to produce a stdin for qrexec child proc."
+        ))?;
 
-        let stdout = child.stdout.take().ok_or(
-            anyhow!(
-                "Error: failed to produce a for qrexec child proc."
-            )
-        )?;
+        let stdout = child.stdout.take().ok_or(anyhow!(
+            "Error: failed to produce a for qrexec child proc."
+        ))?;
 
         return Ok(Self {
             _child: child, 
