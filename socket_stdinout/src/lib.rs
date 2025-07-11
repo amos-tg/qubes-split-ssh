@@ -2,8 +2,8 @@ mod msg_header;
 pub mod debug;
 pub mod types;
 
-use types::{DynError, DynFutError};
-use debug::debug_append;
+use types::{DynError, DTErr};
+use debug::{debug_append, debug_err_append};
 use msg_header::{
     MsgHeader,
     HEADER_LEN,
@@ -12,16 +12,20 @@ use msg_header::{
 use std::{
     fs,
     env,
+    error::Error,
     time::Duration,
     ops::{Deref, DerefMut},
-    io::{Read, Write},
+    io::{self, Read, Write, ErrorKind::WouldBlock},
     sync::{
         atomic::{AtomicBool, Ordering::*},
         Arc,
         Mutex,
     },
-    os::unix::net::{UnixListener, UnixStream},
-    thread::JoinHandle,
+    os::unix::{
+        net::{UnixListener, UnixStream},
+        fs::PermissionsExt,
+    },
+    thread::{JoinHandle, self},
 };
 
 use anyhow::anyhow;
@@ -30,77 +34,65 @@ pub const ERR_LOG_DIR_NAME: &str = "split-ssh";
 const SLEEP_TIME_MILLIS: u64 = 100; 
 
 type Thread = 
-    JoinHandle<Result<(), Box<dyn std::error::Error + Send>>>
-;
+    JoinHandle<Result<(), Box<dyn Error + 'static + Send>>>;
 
 pub struct SockStdInOutCon {
-    fd_writer: Thread,
-    fd_reader: Thread,
-    sock_writer: Thread,
-    sock_reader: Thread,
+    kill: Arc<AtomicBool>,
+    sockreader_fdwriter: Thread,
+    sockwriter_fdreader: Thread,
 }
 
 impl<'a> SockStdInOutCon {
-    pub async fn spawn(
-        stream: UnixStream,
-        std_written: Arc<Mutex<Write>>,
-        std_read: Arc<Mutex<Read>>,
-    ) -> DynFutError<()> {
-        let timeout = Arc::new(
-            AtomicBool::new(false)
-        );
-
-        let (read_half, write_half) = stream.into_split();
-        let (read_half, write_half) = (
-            Arc::new(read_half),
-            Arc::new(Mutex::new(write_half)),
-        );
-
-        let sockr_fdw_buf = Arc::new(Mutex::new(Vec::new()));
-        let sockw_fdr_buf = Arc::new(Mutex::new(Vec::new()));
-
-        let sock_reader = {
-            let sock_reader = SockReader {
-                read: read_half.clone(),
-                buf: sockr_fdw_buf.clone(),
-                timeout: timeout.clone(),
-            }.new();
-            task::spawn(sock_reader)
-        };
-
-        let sock_writer = {
-            let sock_writer = SockWriter {
-                written: write_half.clone(),
-                buf: sockw_fdr_buf.clone(),
-            }.new();
-            task::spawn(sock_writer)
-        };
-
-        let fd_reader = { 
-            let fd_reader = FdReader {
-                read: std_read.clone(),
-                buf: sockw_fdr_buf.clone(),
-            }.new();
-            task::spawn(fd_reader)
-        };
-
-        let fd_writer = {
-            let fd_writer = FdWriter {
-                written: std_written.clone(),
-                buf: sockr_fdw_buf.clone(),
-            }.new();
-            task::spawn(fd_writer)
-        };
-
-        return Self {
-            fd_writer,
-            fd_reader,
-            sock_writer,
-            sock_reader,
-        }.handler(timeout).await;
+    #[inline(always)]
+    pub fn stream_and_touts(listener: &UnixListener) -> DynError<Arc<Mutex<UnixStream>>> {
+        const READ_TOUT_SECS: u64 = 5;
+        const WRITE_TOUT_SECS: u64 = 5;
+        let stream = listener.accept()?.0;
+        stream.set_read_timeout(
+            Some(Duration::from_secs(READ_TOUT_SECS)))?; 
+        stream.set_write_timeout(
+            Some(Duration::from_secs(WRITE_TOUT_SECS)))?;
+        return Ok(Arc::new(Mutex::new(stream)));
     }
 
-    async fn handler(self, timeout: Arc<AtomicBool>) -> DynFutError<()> {
+    pub fn spawn(
+        listener: UnixListener,
+        written: Arc<Mutex<impl Write>>,
+        read: Arc<Mutex<impl Read>>,
+    ) -> DynError<()> {
+        let kill = Arc::new(AtomicBool::new(false));
+        let timeout = Arc::new(
+            AtomicBool::new(false));
+        let sockr_fdw_buf = Arc::new(Mutex::new(Vec::new()));
+        let sockw_fdr_buf = Arc::new(Mutex::new(Vec::new()));
+        let stream = Self::stream_and_touts(&listener)?;
+
+        let sockr_fdw = thread::spawn( || {
+            SockReaderFdWriter {
+                stream: stream.clone(),
+                fd: written.clone(),
+                timeout: timeout.clone(),
+                kill: kill.clone(),
+            }.spawn() 
+        });
+
+        let sockw_fdr = thread::spawn( || {
+            SockWriterFdReader {
+                stream: stream.clone(),
+                fd: read.clone(),
+                timeout: timeout.clone(),
+                kill: kill.clone(),
+            }.spawn()
+        });
+
+        return Self {
+            kill,
+            sockreader_fdwriter: sockr_fdw,
+            sockwriter_fdreader: sockw_fdr,
+        }.handler(timeout);
+    }
+
+    fn handler(self, timeout: Arc<AtomicBool>) -> DynError<()> {
         const HNDLER_ERR: &str = "finished with an impossible return val.";
         // you should make this an argument to the program so people with diff. requirements
         // can use it with a bigger timeout. 
@@ -110,12 +102,12 @@ impl<'a> SockStdInOutCon {
             macro_rules! taskerr {
                 ($err:expr, $task:literal) => {
                     match $err {
-                        Err(e) => {
+                        Err(err) => {
                             return Err(anyhow!(
                                 format!(
                                     "Error: task={} : {}",
                                     $task,
-                                    e.to_string()
+                                    err.to_string()
                                 )
                             ).into())
                         },
@@ -129,12 +121,23 @@ impl<'a> SockStdInOutCon {
                 SockReader::INACTIVE => t_out_counter += 1,
             }
 
+            if self.sock_reader.is_finished() {
+                self.fd_writer.abort();
+                self.fd_reader.abort();
+                self.sock_writer.abort();
+                taskerr!(
+                    self.sock_reader,
+                    "SockReader"
+                );
+                unreachable!("Error: sock_reader {HNDLER_ERR}");
+            }
+
             if self.fd_writer.is_finished() { 
                 self.fd_reader.abort(); 
                 self.sock_writer.abort();
                 self.sock_reader.abort();
                 taskerr!(
-                    wield_err!(self.fd_writer.await),
+                    self.fd_writer,
                     "FdWriter"
                 );
                 unreachable!("Error: fd_writer {HNDLER_ERR}");
@@ -145,7 +148,7 @@ impl<'a> SockStdInOutCon {
                 self.sock_writer.abort();
                 self.sock_reader.abort();
                 taskerr!(
-                    wield_err!(self.fd_reader.await),
+                    wield_err!(self.fd_reader),
                     "FdReader"
                 );
                 unreachable!("Error: fd_reader {HNDLER_ERR}");
@@ -156,155 +159,165 @@ impl<'a> SockStdInOutCon {
                 self.fd_reader.abort();
                 self.sock_reader.abort();
                 taskerr!(
-                    wield_err!(self.sock_writer.await),
+                    self.sock_writer,
                     "SockWriter"
                 );
                 unreachable!("Error: sock_writer {HNDLER_ERR}");
             }
 
-            if self.sock_reader.is_finished() {
-                self.fd_writer.abort();
-                self.fd_reader.abort();
-                self.sock_writer.abort();
-                taskerr!(
-                    wield_err!(self.sock_reader.await),
-                    "SockReader"
-                );
-                unreachable!("Error: sock_reader {HNDLER_ERR}");
-            }
 
             if t_out_counter == T_OUT_MAX {
                 break Ok(());
             }
 
-            time::sleep(
+            thread::sleep(
                 Duration::from_millis(SLEEP_TIME_MILLIS)
-            ).await;
+            );
         }
     }
 }
 
-struct SockReader {
-    read: Arc<OwnedReadHalf>,
-    buf: Arc<Mutex<Vec<u8>>>,
-    timeout: Arc<AtomicBool>,
+impl Drop for SockStdInOutCon {
+    fn drop(&mut self) {
+        self.kill.store(true, SeqCst); 
+    }
 }
 
-impl SockReader {
+struct SockReaderFdWriter<T: Write> {
+    stream: Arc<Mutex<UnixStream>>,
+    fd: Arc<Mutex<T>>,
+    timeout: Arc<AtomicBool>,
+    kill: Arc<AtomicBool>,
+}
+
+impl<T: Write> SockReaderFdWriter<T> {
     const ACTIVE: bool = true;
     const INACTIVE: bool = false;
     const DEBUG_FNAME: &str = "SockReader";
-    pub async fn new(self) -> DynFutError<()> {
-        let mut int_buf: Vec<u8> = Vec::new();
-        loop {
-            debug_append(
-                "Starting SockReader iteration...\n",
+    pub fn spawn(self) {
+        let mut int_buf = Vec::new();
+        let mut buf = Vec::new();
+        let mut buf_len: usize;
+        let mut cursor;
+        'reconn: loop {
+            // make sure not to block indefinitely by panic'ing in main 
+            // while holding the stream mutex guard
+            let stream = self.stream.lock();
+            debug_err_append(
+                &stream,
                 Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME,
-            );
+                ERR_LOG_DIR_NAME);
+            let mut stream = stream.unwrap();
 
-            let mut buf = self.buf.lock().await;
-
-            if !buf.is_empty() { 
-                drop(buf);
-                time::sleep(
-                    Duration::from_millis(SLEEP_TIME_MILLIS)
-                ).await;
-                continue; 
-            }
-
-            debug_append(
-                "starting read...\n",
+            let fd = self.fd.lock();
+            debug_err_append(
+                &fd,
                 Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME,
-            );
+                ERR_LOG_DIR_NAME);
+            let mut fd = fd.unwrap();
 
-            let mut cursor = 0usize;
             loop {
-                wield_err!(self.read.readable().await);
-                match self.read.try_read(&mut int_buf[cursor..]) {
-                    Ok(num_read) => {
-                        if num_read == 0 {
-                            self.timeout.store(Self::INACTIVE, SeqCst);
-                            break;
-                        } else { 
-                            self.timeout.store(Self::ACTIVE, SeqCst);
+                loop {
+                    if self.kill.load(SeqCst) { panic!() }
+                    match stream.read(&mut int_buf[cursor..]) {
+                        Ok(num_read) => if num_read != 0 {
                             cursor += num_read;
+                            break;
+                        } else {
+                            cursor = 0;
+                            int_buf.clear();
+                            buf.clear();
+                            continue 'reconn;
+                        }
+
+                        Err(err) if err.kind() == 
+                            io::ErrorKind::Interrupted => continue,
+
+                        
+                        Err(err) if err.kind() == 
+                            io::ErrorKind::TimedOut => continue 'reconn,
+
+                        Err(_) => {
+                            cursor = 0;
+                            int_buf.clear();
+                            buf.clear();
+                            continue 'reconn;
+                        }
+                    };
+                }
+
+                buf.extend_from_slice(
+                    &MsgHeader::new(cursor as u64).0);
+                buf.extend_from_slice(&int_buf[..cursor]);
+                buf_len = cursor + HEADER_LEN;
+                buf.truncate(buf_len);
+
+                int_buf.clear();
+
+                cursor = 0;
+                while cursor < buf_len {
+                    if self.kill.load(SeqCst) { panic!() }
+                    match fd.write(&buf[cursor..]) {
+                        Ok(n_bytes) => cursor += n_bytes,
+
+                        Err(err) if err.kind() ==
+                            io::ErrorKind::Interrupted => continue,
+
+                        Err(_) => {
+                            cursor = 0;
+                            buf.clear();
+                            continue 'reconn;
                         }
                     }
+                }
 
-                    Err(ref e) if e.kind() == WouldBlock => continue,
-                    Err(e) => return Err(Box::new(e)),
-                };
+                cursor = 0;
+                buf.clear();
+                if fd.flush().is_err() {
+                    continue 'reconn;
+                }
             }
-
-            let buf_len = int_buf.len() as u64; 
-            if buf_len == 0 {
-                continue;
-            }
-
-            buf.extend_from_slice(&MsgHeader::new(buf_len).0);
-            buf.extend_from_slice(&int_buf[..cursor]);
-            buf.truncate(cursor + HEADER_LEN);
-
-            debug_append(
-                &format!(
-                    "{} <- Read buffer\n",
-                    wield_err!(
-                        str::from_utf8(&buf)
-                    ),
-                ),
-                Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME,
-            );
         }
     }
 }
 
-struct FdWriter<U: AsyncWriteExt + Unpin> {
+struct FdWriter<U: Write> {
     written: Arc<Mutex<U>>,
     buf: Arc<Mutex<Vec<u8>>>,
+    kill: Arc<AtomicBool>,
 }
 
-impl<U: AsyncWriteExt + Unpin> FdWriter<U> {
+impl<U: Write> FdWriter<U> {
     const DEBUG_FNAME: &str = "FdWriter"; 
-    pub async fn new(self) -> DynFutError<()> {
+    pub async fn new(self) -> DTErr<()> {
         loop {
-            debug_append(
-                "Starting iteration... \n",
-                Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME,
-            );
+            let (mut buf, mut buf_len) = loop {
+                let buf = self.buf.lock(); 
+                debug_err_append(
+                    &buf,    
+                    Self::DEBUG_FNAME,
+                    ERR_LOG_DIR_NAME);
+                let buf = buf.unwrap();
 
-            let mut buf;
-            let mut buf_len;
-            loop {
-                buf = self.buf.lock().await; 
-                buf_len = buf.len();
+                let buf_len = buf.len();
                 if buf_len == 0 {
                     drop(buf);
-                    time::sleep(
-                        Duration::from_millis(SLEEP_TIME_MILLIS)
-                    ).await;
+                    thread::sleep(
+                        Duration::from_millis(SLEEP_TIME_MILLIS));
                     continue; 
                 } else {
-                    break;
+                    break (buf, buf_len);
                 }
-            }
+            };
 
-            debug_append(
-                "got a buffer with content, starting write...\n", 
-                Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME,
-            );
-
-            let mut written = self.written.lock().await;
+            let mut written = self.written.lock();
             let mut bytes = 0;
+
             while bytes < buf_len {
                 match written.write(&buf[bytes..]).await {
                     Ok(n_bytes) => bytes += n_bytes,
                     Err(ref e) if e.kind() == WouldBlock => {
-                        time::sleep(
+                        thread::sleep(
                             Duration::from_millis(SLEEP_TIME_MILLIS)
                         ).await;
                         continue;
@@ -326,12 +339,13 @@ impl<U: AsyncWriteExt + Unpin> FdWriter<U> {
     } 
 }
 
-struct FdReader<T: AsyncReadExt + Unpin> {
+struct FdReader<T: Read> {
     read: Arc<Mutex<T>>, 
     buf: Arc<Mutex<Vec<u8>>>,
+    kill: Arc<AtomicBool>,
 }
 
-impl<T: AsyncReadExt + Unpin> FdReader<T> {
+impl<T: Read> FdReader<T> {
     const DEBUG_FNAME: &str = "FdReader";
     pub async fn new(self) -> DynFutError<()> {
         loop {
@@ -341,10 +355,10 @@ impl<T: AsyncReadExt + Unpin> FdReader<T> {
                 ERR_LOG_DIR_NAME,
             );
 
-            let mut buf = self.buf.lock().await;
+            let mut buf = self.buf.lock();
             if !buf.is_empty() { 
                 drop(buf);
-                time::sleep(
+                thread::sleep(
                     Duration::from_millis(SLEEP_TIME_MILLIS)
                 ).await;
                 continue; 
@@ -416,64 +430,57 @@ impl<T: AsyncReadExt + Unpin> FdReader<T> {
 }
 
 struct SockWriter {
-    written: Arc<Mutex<OwnedWriteHalf>>,
+    written: Arc<Mutex<UnixStream>>,
     buf: Arc<Mutex<Vec<u8>>>,
+    kill: Arc<AtomicBool>,
 }
 
 impl SockWriter {
     const DEBUG_FNAME: &str = "SockWriter";
-    pub async fn new(self) -> DynFutError<()> {
+    pub fn new(self) -> DTErr<()> {
         loop {
-            debug_append(
-                "starting iteration...\n",
+            let buf = self.buf.lock();
+            debug_err_append(
+                &buf,
                 Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME,
-            );
-
-            let mut written = self.written.lock().await;
-            let mut buf = self.buf.lock().await;
-
+                ERR_LOG_DIR_NAME);
+            let mut buf = buf.unwrap();
             if buf.is_empty() {
                 drop(buf);
-                time::sleep(
-                    Duration::from_millis(SLEEP_TIME_MILLIS)
-                ).await;
+                thread::sleep(
+                    Duration::from_millis(SLEEP_TIME_MILLIS));
                 continue;
             }
 
-            let mut bytes = 0usize;
-            let mut header_cln = [0u8; 8];
-            header_cln.clone_from_slice(&buf[..8]);
-            let msg_len = MsgHeader::len(header_cln) as usize;
-
-            debug_append(
-                format!("starting {} length write...\n", msg_len),
+            let written = self.written.lock();
+            debug_err_append(
+                &written,
                 Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME,
-            );
-
-            while bytes < msg_len {
-                match written.write(&mut buf[bytes..msg_len]).await {
-                    Ok(num_bytes) => bytes += num_bytes,
-                    Err(ref e) if e.kind() == WouldBlock => {
-                        time::sleep(Duration::from_millis(SLEEP_TIME_MILLIS)).await;
-                        continue;
-                    }
+                ERR_LOG_DIR_NAME);
+            let mut written = written.unwrap();
+            let tout = written.set_write_timeout(Some(Duration::from_secs(5)));
+            debug_err_append(
+                &tout,
+                Self::DEBUG_FNAME,
+                ERR_LOG_DIR_NAME);
+            tout.unwrap();
+            
+            let buf_len = buf.len();
+            let mut cursor = 0usize;
+            while cursor < buf_len {
+                if self.kill.load(SeqCst) { panic!() }
+                match written.write(&mut buf[cursor..buf_len]) {
+                    Ok(0) => return Err(anyhow!(
+                        "Error: {}: reached EOF", Self::DEBUG_FNAME).into()),
+                    Ok(n) => cursor += n,
                     Err(e) => return Err(Box::new(e)),
                 } 
             }
-
-            debug_append(
-                "finished write\n",
-                Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME,
-            );
 
             buf.clear();
         }
     }
 }
-
 
 const SOCK_VAR: &str = "SSH_AUTH_SOCK";
 
@@ -482,7 +489,7 @@ pub struct SockStream(UnixStream);
 impl SockStream {
     pub fn get_auth_stream() -> DynError<Self> {
         let path = env::var(SOCK_VAR)?;
-        let sock = if std::fs::exists(&path)? {
+        let sock = if fs::exists(&path)? {
             UnixStream::connect(&path)?
         } else {
             return Err(anyhow!(
@@ -495,8 +502,8 @@ impl SockStream {
     
     pub fn handle_connections(
         self,
-        std_written: Write + Send,
-        std_read: Read + Send,
+        std_written: impl Write,
+        std_read: impl Read,
     ) -> DynFutError<()> {
         let (std_written, std_read) = (
             Arc::new(Mutex::new(std_written)),
@@ -533,11 +540,11 @@ impl SockListener {
         return Ok(Self(sock))
     }
 
-    pub async fn handle_connections(
+    pub fn handle_connections(
         &self,
-        std_written: Write + Send,
-        std_read: Read + Send,
-    ) -> DynFutError<()> {
+        std_written: impl Write,
+        std_read: impl Read,
+    ) -> DynError<()> {
         let (std_written, std_read) = (
             Arc::new(Mutex::new(std_written)),
             Arc::new(Mutex::new(std_read)),
@@ -545,7 +552,7 @@ impl SockListener {
 
         loop {
             SockStdInOutCon::spawn(
-                wield_err!(self.0.accept().await).0,
+                self.0.accept()?.0,
                 std_written.clone(),
                 std_read.clone(),
             )?;

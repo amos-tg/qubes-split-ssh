@@ -4,8 +4,26 @@ use std::{
     io::Write,
 };
 
+/// sends errors over the channel
+/// (error: Error, sender: Sender<T>)
+#[macro_export] 
+macro_rules! cerr {
+    ($err:expr, $sender:expr) => {
+        match $err {
+            Err(e) => {
+                $sender.send(e)
+                    .expect(&format!(
+                        "Error: failed to send err_msg; {}",
+                        e.to_string()));
+                continue;
+            }
+            Ok(thing) => thing,
+        }
+    };
+}
+
 #[macro_export]
-macro_rules! wield_err {
+macro_rules! err {
     ($err:expr) => {
         match $err {
             Err(e) => return Err(Box::new(e)),
