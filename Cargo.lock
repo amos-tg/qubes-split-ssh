@@ -233,7 +233,6 @@ name = "socket_stdinout"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "tokio",
 ]
 
 [[package]]
