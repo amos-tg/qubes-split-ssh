@@ -2,7 +2,7 @@ mod msg_header;
 pub mod debug;
 pub mod types;
 
-use types::{DynError, DTErr};
+use types::DynError;
 use debug::{debug_append, debug_err_append};
 use msg_header::{
     MsgHeader,
@@ -12,10 +12,9 @@ use msg_header::{
 use std::{
     fs,
     env,
-    error::Error,
     time::Duration,
     ops::{Deref, DerefMut},
-    io::{self, Read, Write, ErrorKind::WouldBlock},
+    io::{self, Read, Write},
     sync::{
         atomic::{AtomicBool, Ordering::*},
         Arc,
@@ -27,92 +26,56 @@ use std::{
     },
     thread::{JoinHandle, self},
 };
-
 use anyhow::anyhow;
 
 pub const ERR_LOG_DIR_NAME: &str = "split-ssh";
-const SLEEP_TIME_MILLIS: u64 = 100; 
 
 type Thread = JoinHandle<()>;
 
 pub struct SockStdInOutCon {
     kill: Arc<AtomicBool>,
     broken_pipe: Arc<AtomicBool>,
-    timeout: Arc<AtomicBool>,
+    sock_reader_fd_writer: Thread,
+    sock_writer_fd_reader: Thread,
 }
 
 impl<'a> SockStdInOutCon {
-    const DEBUG_FNAME: &'static str = "Main";
-    const SLEEP_TIME_SECS: u64 = 15;
-
-    #[inline(always)]
-    pub fn stream_and_touts(listener: &UnixListener) -> DynError<Arc<Mutex<UnixStream>>> {
-        const READ_TOUT_SECS: u64 = 5;
-        const WRITE_TOUT_SECS: u64 = 5;
-        let stream = listener.accept()?.0;
-        stream.set_read_timeout(
-            Some(Duration::from_secs(READ_TOUT_SECS)))?; 
-        stream.set_write_timeout(
-            Some(Duration::from_secs(WRITE_TOUT_SECS)))?;
-        return Ok(Arc::new(Mutex::new(stream)));
-    }
-
-    pub fn client() {
-        
-    }
-
-    pub fn vault(
+    fn spawn<T, U>(
         stream: Arc<Mutex<UnixStream>>,
-        written: Arc<Mutex<impl Write>>,
-        read: Arc<Mutex<impl Read>>,
-    ) {
-        let conn = Self::spawn(
-            stream,   
-            written,
-            read);
-
-        loop {
-            thread::sleep(Duration::from_secs(Self::SLEEP_TIME_SECS));
-        }
-    }
-  
-    fn spawn(
-        stream: Arc<Mutex<UnixStream>>,
-        written: Arc<Mutex<impl Write>>,
-        read: Arc<Mutex<impl Read>>,
-    ) -> Self {
+        written: Arc<Mutex<T>>,
+        read: Arc<Mutex<U>>,
+    ) -> Self where
+        T: Write + Send + Sync + 'static,
+        U: Read + Send + Sync + 'static,
+    {
         let kill = Arc::new(AtomicBool::new(false));
-        let timeout = Arc::new(
-            AtomicBool::new(false));
         let broken_pipe = Arc::new(AtomicBool::new(false));
 
-        let sockr_fdw_buf = Arc::new(Mutex::new(Vec::new()));
-        let sockw_fdr_buf = Arc::new(Mutex::new(Vec::new()));
-
-        let sockr_fdw = thread::spawn( || {
-            SockReaderFdWriter {
+        let sock_reader_fd_writer = {
+            let srfw = SockReaderFdWriter {
                 stream: stream.clone(),
                 fd: written.clone(),
-                timeout: timeout.clone(),
                 kill: kill.clone(),
                 broken_pipe: broken_pipe.clone(),
-            }.spawn() 
-        });
+            };
+            thread::spawn(move || { srfw.spawn() })  
+        };
 
-        let sockw_fdr = thread::spawn( || {
-            SockWriterFdReader {
+        let sock_writer_fd_reader = {
+            let swfr = SockWriterFdReader {
                 stream: stream.clone(),
                 fd: read.clone(),
-                timeout: timeout.clone(),
                 kill: kill.clone(),
                 broken_pipe: broken_pipe.clone(),
-            }.spawn()
-        });
+            };
+            thread::spawn(move || { swfr.spawn() })
+        };
 
         Self {
             kill,
             broken_pipe,
-            timeout,
+            sock_reader_fd_writer, 
+            sock_writer_fd_reader,
         }
     }
 }
@@ -126,23 +89,20 @@ impl Drop for SockStdInOutCon {
 struct SockReaderFdWriter<T: Write> {
     stream: Arc<Mutex<UnixStream>>,
     fd: Arc<Mutex<T>>,
-    timeout: Arc<AtomicBool>,
     kill: Arc<AtomicBool>,   
     broken_pipe: Arc<AtomicBool>,
 }
 
 impl<T: Write> SockReaderFdWriter<T> {
-    const ACTIVE: bool = true;
-    const INACTIVE: bool = false;
     const DEBUG_FNAME: &str = "SockReaderFdWriter";
-    pub fn spawn(self) {
+    pub fn spawn(self) { 
         let mut int_buf = Vec::new();
         let mut buf = Vec::new();
         let mut buf_len: usize;
         let mut cursor = 0usize;
         'reconn: loop {
-            // make sure not to block indefinitely by panic'ing in main 
-            // while holding the stream mutex guard
+            if self.kill.load(SeqCst) { panic!() }
+
             let stream = self.stream.lock();
             debug_err_append(
                 &stream,
@@ -158,70 +118,69 @@ impl<T: Write> SockReaderFdWriter<T> {
             let mut fd = fd.unwrap();
 
             loop {
-                loop {
-                    if self.kill.load(SeqCst) { panic!() }
-                    match stream.read(&mut int_buf[cursor..]) {
-                        Ok(num_read) => if num_read != 0 {
-                            cursor += num_read;
-                            break;
-                        } else {
-                            cursor = 0;
-                            int_buf.clear();
-                            buf.clear();
-                            continue 'reconn;
-                        }
+                match stream.read(&mut int_buf[cursor..]) {
+                    Ok(num_read) => if num_read != 0 {
+                        cursor += num_read;
+                        break;
+                    } else {
+                        cursor = 0;
+                        int_buf.clear();
+                        continue 'reconn;
+                    }
 
-                        Err(err) if err.kind() == 
-                            io::ErrorKind::Interrupted => continue,
-                        
-                        Err(err) if err.kind() == 
-                            io::ErrorKind::TimedOut => continue 'reconn,
+                    Err(err) if err.kind() == 
+                        io::ErrorKind::Interrupted => continue 'reconn,
+                    
+                    Err(err) if err.kind() == 
+                        io::ErrorKind::TimedOut => continue 'reconn,
 
-                        Err(err) if err.kind() == 
-                            io::ErrorKind::BrokenPipe => {
-                            
-                        }
+                    Err(err) if err.kind() == 
+                        io::ErrorKind::BrokenPipe => {
+                        cursor = 0;
+                        int_buf.clear(); 
+                        self.broken_pipe.store(true, SeqCst);
+                        continue 'reconn; 
+                    }
 
-                        Err(_) => {
-                            cursor = 0;
-                            int_buf.clear();
-                            buf.clear();
-                            continue 'reconn;
-                        }
-                    };
-                }
+                    Err(err) => {
+                        debug_err_append(
+                            &Err::<(), io::Error>(err),
+                            Self::DEBUG_FNAME,
+                            ERR_LOG_DIR_NAME);
+                        cursor = 0;
+                        int_buf.clear();
+                        continue 'reconn;
+                    }
+                };
+            }
 
-                buf.extend_from_slice(
-                    &MsgHeader::new(cursor as u64).0);
-                buf.extend_from_slice(&int_buf[..cursor]);
-                buf_len = cursor + HEADER_LEN;
-                buf.truncate(buf_len);
+            buf.extend_from_slice(
+                &MsgHeader::new(cursor as u64).0);
+            buf.extend_from_slice(&int_buf[..cursor]);
+            buf_len = cursor + HEADER_LEN;
+            buf.truncate(buf_len);
+            int_buf.clear();
 
-                int_buf.clear();
+            cursor = 0;
+            while cursor < buf_len {
+                match fd.write(&buf[cursor..]) {
+                    Ok(n_bytes) => cursor += n_bytes,
 
-                cursor = 0;
-                while cursor < buf_len {
-                    if self.kill.load(SeqCst) { panic!() }
-                    match fd.write(&buf[cursor..]) {
-                        Ok(n_bytes) => cursor += n_bytes,
+                    Err(err) if err.kind() ==
+                        io::ErrorKind::Interrupted => continue,
 
-                        Err(err) if err.kind() ==
-                            io::ErrorKind::Interrupted => continue,
-
-                        Err(_) => {
-                            cursor = 0;
-                            buf.clear();
-                            continue 'reconn;
-                        }
+                    Err(_) => {
+                        cursor = 0;
+                        buf.clear();
+                        continue 'reconn;
                     }
                 }
-
-                cursor = 0;
-                buf.clear();
-                if fd.flush().is_err() {
-                    continue 'reconn;
-                }
             }
+
+            cursor = 0;
+            buf.clear();
+            let _ = fd.flush();
+            
         }
     }
 }
@@ -230,22 +189,28 @@ struct SockWriterFdReader<T: Read> {
     stream: Arc<Mutex<UnixStream>>,
     fd: Arc<Mutex<T>>, 
     kill: Arc<AtomicBool>,
+    broken_pipe: Arc<AtomicBool>,
 }
 
 impl<T: Read> SockWriterFdReader<T> {
     const DEBUG_FNAME: &str = "SockWriterFdReader";
-    pub async fn new(self) {
+    const MSG_LEN_UNEQ: &str = "Error: the msg_len != cursor\n"; 
+    pub fn spawn(self) {
         let mut buf = Vec::new();
         let mut msg_len;
-        let mut cursor = 0;
-        let mut header: [u8; HEADER_LEN];
+        let mut cursor;
+        let mut header = [0u8; HEADER_LEN];
+        let mut stream;
+        let mut stream_res;
         'reconn: loop {
-            let stream = self.stream.lock();
+            if self.kill.load(SeqCst) { panic!() }
+
+            stream_res = self.stream.lock();
             debug_err_append(
-                &stream,
+                &stream_res,
                 Self::DEBUG_FNAME,
                 ERR_LOG_DIR_NAME);
-            let mut stream = stream.unwrap();
+            stream = stream_res.unwrap();
 
             let fd = self.fd.lock();
             debug_err_append(
@@ -256,109 +221,164 @@ impl<T: Read> SockWriterFdReader<T> {
 
             loop {
                 match fd.read_exact(&mut buf[..HEADER_LEN]) {
-                    Ok(_) => cursor += HEADER_LEN, 
+                    Ok(_) => (),
 
-                    Err(e) if e.kind() == 
-                        io::ErrorKind::UnexpectedEof=> {
-                            cursor = 0;
-                            continue 'reconn; 
+                    Err(err) if err.kind() == 
+                        io::ErrorKind::Interrupted => continue, 
+
+                    Err(err) if err.kind() == 
+                        io::ErrorKind::UnexpectedEof => {
+                        debug_err_append(
+                            &Err::<(), io::Error>(err),
+                            Self::DEBUG_FNAME,
+                            ERR_LOG_DIR_NAME);
+                        buf.clear();
+                        continue 'reconn; 
+                    }
+
+                    Err(err) if err.kind() == 
+                        io::ErrorKind::BrokenPipe => {
+                        buf.clear();
+                        self.broken_pipe.store(true, SeqCst);
+                        continue 'reconn;
                     }
 
                     Err(err) => {
                         debug_err_append(
-                            &Err(err),
+                            &Err::<(), io::Error>(err),
                             Self::DEBUG_FNAME,
                             ERR_LOG_DIR_NAME);
-                        cursor = 0;
+                        buf.clear();
                         continue 'reconn;
                     }
                 }
 
                 header.clone_from_slice(&buf[..HEADER_LEN]);
-                msg_len = MsgHeader::len(header);
-                cursor -= 8;
+                buf.clear();
+                msg_len = MsgHeader::len(header); 
 
-                if cursor as u64 != msg_len {
-                    loop {
-                        match fd.read(&mut buf) {
-                            Ok(bytes) => cursor += bytes,
-                            Err(ref e) if e.kind() == WouldBlock => {
-                                if cursor as u64 == msg_len {
-                                    break;
-                                }
-                            }
-                            Err(e) => (),
+                cursor = 0;
+                while (cursor as u64) < msg_len {
+                    match fd.read(&mut buf[cursor..]) {
+                        Ok(n_bytes) => cursor += n_bytes,
+
+                        Err(err) if err.kind() ==
+                            io::ErrorKind::Interrupted => continue,
+                        
+                        Err(err) if err.kind() == 
+                            io::ErrorKind::UnexpectedEof => {
+                            debug_err_append(
+                                &Err::<(), io::Error>(err),
+                                Self::DEBUG_FNAME,
+                                ERR_LOG_DIR_NAME);
+                            buf.clear();
+                            continue 'reconn; 
+                        }
+
+                        Err(err) => {
+                            debug_err_append(
+                                &Err::<(), io::Error>(err),
+                                Self::DEBUG_FNAME,
+                                ERR_LOG_DIR_NAME);
+                            buf.clear();
+                            continue 'reconn;
                         }
                     }
                 }
 
-                debug_append(
-                    format!(
-                        "What was read: {}\n",
-                        wield_err!(str::from_utf8(&*buf.clone())),
-                    ),
-                    Self::DEBUG_FNAME,
-                    ERR_LOG_DIR_NAME,
-                );
-            }
-        }
-    }
-}
+                #[cfg(debug_assertions)]
+                if (cursor as u64) != msg_len {
+                    debug_append(
+                        Self::MSG_LEN_UNEQ, 
+                        Self::DEBUG_FNAME,
+                        ERR_LOG_DIR_NAME);
+                }
 
-struct SockWriter {
-    written: Arc<Mutex<UnixStream>>,
-    buf: Arc<Mutex<Vec<u8>>>,
-    kill: Arc<AtomicBool>,
-}
+                cursor = 0;
+                while (cursor as u64) < msg_len {
+                    match stream.write(&buf[cursor..]) {
+                        Ok(n_bytes) => cursor += n_bytes,
 
-impl SockWriter {
-    const DEBUG_FNAME: &str = "SockWriter";
-    pub fn new(self) -> DTErr<()> {
-        loop {
-            let buf = self.buf.lock();
-            debug_err_append(
-                &buf,
-                Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME);
-            let mut buf = buf.unwrap();
-            if buf.is_empty() {
-                drop(buf);
-                thread::sleep(
-                    Duration::from_millis(SLEEP_TIME_MILLIS));
-                continue;
-            }
+                        Err(err) if err.kind() == 
+                            io::ErrorKind::TimedOut => {
+                            drop(stream);
+                            stream_res = self.stream.lock();
+                            debug_err_append(
+                                &stream_res,
+                                Self::DEBUG_FNAME,
+                                ERR_LOG_DIR_NAME);
+                            stream = stream_res.unwrap();
+                            continue;
+                        }
 
-            let written = self.written.lock();
-            debug_err_append(
-                &written,
-                Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME);
-            let mut written = written.unwrap();
-            let tout = written.set_write_timeout(Some(Duration::from_secs(5)));
-            debug_err_append(
-                &tout,
-                Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME);
-            tout.unwrap();
-            
-            let buf_len = buf.len();
-            let mut cursor = 0usize;
-            while cursor < buf_len {
-                if self.kill.load(SeqCst) { panic!() }
-                match written.write(&mut buf[cursor..buf_len]) {
-                    Ok(0) => return Err(anyhow!(
-                        "Error: {}: reached EOF", Self::DEBUG_FNAME).into()),
-                    Ok(n) => cursor += n,
-                    Err(e) => return Err(Box::new(e)),
+                        Err(err) if err.kind() == 
+                            io::ErrorKind::Interrupted => {
+                            stream_res = self.stream.lock();
+                            debug_err_append(
+                                &stream_res,
+                                Self::DEBUG_FNAME,
+                                ERR_LOG_DIR_NAME);
+                            stream = stream_res.unwrap();
+                            continue;
+                        }
+
+                        Err(err) if err.kind() ==
+                            io::ErrorKind::UnexpectedEof => {
+                            debug_err_append(
+                                &Err::<(), io::Error>(err),
+                                Self::DEBUG_FNAME,
+                                ERR_LOG_DIR_NAME);
+                            buf.clear();
+                            continue 'reconn;
+                        }
+
+                        Err(err) => {
+                            debug_err_append(
+                                &Err::<(), io::Error>(err),
+                                Self::DEBUG_FNAME,
+                                ERR_LOG_DIR_NAME);
+                            buf.clear();
+                            continue 'reconn;
+                        }
+                    }
                 } 
-            }
 
-            buf.clear();
+                buf.clear();
+            }
         }
     }
+}
+
+#[inline(always)]
+fn stream_and_touts(
+    listener: &UnixListener,
+) -> Result<UnixStream, io::Error> {
+    let stream = listener.accept()?.0;
+    touts(&stream)?;
+    return Ok(stream);
+}
+
+#[inline(always)]
+fn touts(stream: &UnixStream) -> Result<(), io::Error> {
+    const TOUT_SECS: Duration = Duration::from_secs(2);
+    stream.set_read_timeout(
+        Some(TOUT_SECS))?; 
+    stream.set_write_timeout(
+        Some(TOUT_SECS))?;
+    return Ok(());
 }
 
 const SOCK_VAR: &str = "SSH_AUTH_SOCK";
+const SLEEP_DURATION_CTRL: Duration = Duration::from_secs(3);
+const DBG_FNAME_MAIN: &str = "Main";
+const MUTEX_ERR: &str = "Error: poisened UnixStream Mutex...";
+const THREAD_ERR: &str = "Error: at least one of the threads failed";
+
+fn finish_check(conn: &SockStdInOutCon) -> bool {
+    if conn.sock_reader_fd_writer.is_finished() { return true }
+    if conn.sock_writer_fd_reader.is_finished() { return true }
+    return false;
+}
 
 pub struct SockStream(UnixStream);
 
@@ -373,33 +393,45 @@ impl SockStream {
             ).into());
         };
 
+        touts(&sock)?;
         return Ok(Self(sock));
     }
     
-    pub fn handle_connections(
+    pub fn handle_connections<T, U>(
         self,
-        std_written: impl Write,
-        std_read: impl Read,
-    ) -> DynFutError<()> {
-        let (std_written, std_read) = (
-            Arc::new(Mutex::new(std_written)),
-            Arc::new(Mutex::new(std_read)),
-        );
+        written: T,
+        read: U,
+    ) -> Result<(), anyhow::Error> where
+        T: Write + Send + Sync + 'static,
+        U: Read + Send + Sync + 'static, 
+    {
+        let (written, read) = (
+            Arc::new(Mutex::new(written)),
+            Arc::new(Mutex::new(read)));
+        let ctrl = SockStdInOutCon::spawn(
+            Arc::new(Mutex::new(self.0)),
+            written,
+            read);
 
-        SockStdInOutCon::spawn(
-            self.0,
-            std_written,
-            std_read,
-        )?;
+        loop {
+            thread::sleep(SLEEP_DURATION_CTRL);
 
-        return Ok(());
+            if finish_check(&ctrl) { 
+                let thread_err = Err(anyhow!(THREAD_ERR));
+                debug_err_append(
+                    &thread_err,
+                    DBG_FNAME_MAIN,
+                    ERR_LOG_DIR_NAME);
+                return thread_err;
+            }
+        } 
     }  
 }
 
 pub struct SockListener(UnixListener);
 
 impl SockListener {
-    pub async fn get_auth_sock() -> DynError<Self> {
+    pub fn get_auth_sock() -> DynError<Self> {
         let path = env::var(SOCK_VAR)?;
         let sock = if std::fs::exists(&path)? {
             return Err(anyhow!(
@@ -412,27 +444,56 @@ impl SockListener {
         let mut perms = fs::metadata(&path)?.permissions();
         perms.set_mode(0o777);
         fs::set_permissions(&path, perms)?;
-
-        return Ok(Self(sock))
+        sock.set_nonblocking(true)?;
+        return Ok(Self(sock));
     }
 
-    pub fn handle_connections(
-        &self,
-        std_written: impl Write,
-        std_read: impl Read,
-    ) -> DynError<()> {
-        let (std_written, std_read) = (
-            Arc::new(Mutex::new(std_written)),
-            Arc::new(Mutex::new(std_read)),
-        );
+    pub fn handle_connections<T, U>(
+        self,
+        written: T,
+        read: U,
+    ) -> DynError<()> where
+        T: Write + Send + Sync + 'static,
+        U: Read + Send + Sync + 'static, 
+    {
+        let (written, read) = (
+            Arc::new(Mutex::new(written)),
+            Arc::new(Mutex::new(read)));
+        let stream_ctrl = Arc::new(Mutex::new(stream_and_touts(&self.0)?));
+        let thread_ctrl = SockStdInOutCon::spawn(
+            stream_ctrl.clone(),
+            written.clone(),
+            read.clone());
 
-        loop {
-            SockStdInOutCon::spawn(
-                self.0.accept()?.0,
-                std_written.clone(),
-                std_read.clone(),
-            )?;
-        }
+        loop { 
+            thread::sleep(SLEEP_DURATION_CTRL);
+
+            if finish_check(&thread_ctrl) {
+                let thread_err = Err(anyhow!(THREAD_ERR).into()); 
+                debug_err_append(
+                    &thread_err,
+                    DBG_FNAME_MAIN,
+                    ERR_LOG_DIR_NAME);
+                return thread_err;
+            }
+
+            if thread_ctrl.broken_pipe.load(SeqCst) {
+                let conn = match self.0.accept() {
+                    Ok(conn) => conn.0,
+                    Err(err) if err.kind() == 
+                        io::ErrorKind::WouldBlock => continue,
+                    Err(err) => return Err(err.into()),
+                };
+
+                let Ok(mut stream_lock) = stream_ctrl.lock() else {
+                    return Err(anyhow!(
+                        MUTEX_ERR).into());
+                }; 
+
+                *stream_lock = conn;
+                thread_ctrl.broken_pipe.store(false, SeqCst); 
+            }
+        };
     } 
 }
 
