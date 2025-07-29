@@ -1,40 +1,35 @@
+use std::io;
+
 use socket_stdinout::{
     self as sock,
     ERR_LOG_DIR_NAME,
     debug::debug_err_append,
+    types::DynError,
 };
-use tokio::{self, io};
 
 const DEBUG_FNAME: &str = "Main";
 
-#[tokio::main]
-async fn main() {
+fn main() -> DynError<()> {
     let (stdin, stdout) = (
         io::stdin(),  
-        io::stdout(),
-    );
-
+        io::stdout());
     let listener = {
-        let res = sock::SockStream::get_auth_stream().await;
+        let sock_res = sock::SockStream::new();
         debug_err_append(
-            &res,
+            &sock_res,
             DEBUG_FNAME,
-            ERR_LOG_DIR_NAME,
-        );
-        res.expect("Error: Failed sock::SockStream::get_auth_sock")
+            ERR_LOG_DIR_NAME);
+        sock_res?
     };
 
-    let con_res = listener.handle_connections(
+    let conn_res = listener.handle_connections(
         stdout, 
-        stdin,
-    ).await;
-
+        stdin);
     debug_err_append(
-        &con_res,
+        &conn_res,
         DEBUG_FNAME,
-        ERR_LOG_DIR_NAME,
-    );
+        ERR_LOG_DIR_NAME);
+    conn_res?;
 
-    con_res.expect("Error: handle_connections returned");
+    return Ok(());
 }
-

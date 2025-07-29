@@ -4,8 +4,7 @@ pub mod types;
 
 use types::DynError;
 use debug::{debug_append, debug_err_append};
-use msg_header::{
-    MsgHeader,
+use msg_header::{ MsgHeader,
     HEADER_LEN,
 };
 
@@ -40,6 +39,9 @@ pub struct SockStdInOutCon {
 }
 
 impl<'a> SockStdInOutCon {
+    const SRFW_ERR: &'static str = "Error: SockReaderFdWriter failed to spawn";
+    const SWFR_ERR: &'static str = "Error: SockWriterFdReader failed to spawn";
+
     fn spawn<T, U>(
         stream: Arc<Mutex<UnixStream>>,
         written: Arc<Mutex<T>>,
@@ -58,7 +60,11 @@ impl<'a> SockStdInOutCon {
                 kill: kill.clone(),
                 broken_pipe: broken_pipe.clone(),
             };
-            thread::spawn(move || { srfw.spawn() })  
+
+            thread::Builder::new()
+                .name(SockReaderFdWriter::<T>::DEBUG_FNAME.to_string())
+                .spawn(move || { srfw.spawn() })  
+                .expect(Self::SRFW_ERR)
         };
 
         let sock_writer_fd_reader = {
@@ -68,7 +74,11 @@ impl<'a> SockStdInOutCon {
                 kill: kill.clone(),
                 broken_pipe: broken_pipe.clone(),
             };
-            thread::spawn(move || { swfr.spawn() })
+
+            thread::Builder::new()
+                .name(SockWriterFdReader::<U>::DEBUG_FNAME.to_string())
+                .spawn(move || { swfr.spawn() })
+                .expect(Self::SWFR_ERR)
         };
 
         Self {
@@ -129,6 +139,9 @@ impl<T: Write> SockReaderFdWriter<T> {
                     }
 
                     Err(err) if err.kind() == 
+                        io::ErrorKind::WouldBlock => continue 'reconn,
+
+                    Err(err) if err.kind() == 
                         io::ErrorKind::Interrupted => continue 'reconn,
                     
                     Err(err) if err.kind() == 
@@ -180,7 +193,6 @@ impl<T: Write> SockReaderFdWriter<T> {
             cursor = 0;
             buf.clear();
             let _ = fd.flush();
-            
         }
     }
 }
@@ -220,7 +232,7 @@ impl<T: Read> SockWriterFdReader<T> {
             let mut fd = fd.unwrap();
 
             loop {
-                match fd.read_exact(&mut buf[..HEADER_LEN]) {
+                match fd.read_exact(&mut header) {
                     Ok(_) => (),
 
                     Err(err) if err.kind() == 
@@ -232,13 +244,11 @@ impl<T: Read> SockWriterFdReader<T> {
                             &Err::<(), io::Error>(err),
                             Self::DEBUG_FNAME,
                             ERR_LOG_DIR_NAME);
-                        buf.clear();
                         continue 'reconn; 
                     }
 
                     Err(err) if err.kind() == 
                         io::ErrorKind::BrokenPipe => {
-                        buf.clear();
                         self.broken_pipe.store(true, SeqCst);
                         continue 'reconn;
                     }
@@ -248,15 +258,11 @@ impl<T: Read> SockWriterFdReader<T> {
                             &Err::<(), io::Error>(err),
                             Self::DEBUG_FNAME,
                             ERR_LOG_DIR_NAME);
-                        buf.clear();
                         continue 'reconn;
                     }
                 }
 
-                header.clone_from_slice(&buf[..HEADER_LEN]);
-                buf.clear();
                 msg_len = MsgHeader::len(header); 
-
                 cursor = 0;
                 while (cursor as u64) < msg_len {
                     match fd.read(&mut buf[cursor..]) {
@@ -298,6 +304,18 @@ impl<T: Read> SockWriterFdReader<T> {
                 while (cursor as u64) < msg_len {
                     match stream.write(&buf[cursor..]) {
                         Ok(n_bytes) => cursor += n_bytes,
+
+                        Err(err) if err.kind() == 
+                            io::ErrorKind::WouldBlock => {
+                            drop(stream);
+                            stream_res = self.stream.lock();
+                            debug_err_append(
+                                &stream_res,
+                                Self::DEBUG_FNAME,
+                                ERR_LOG_DIR_NAME);
+                            stream = stream_res.unwrap();
+                            continue;
+                        }
 
                         Err(err) if err.kind() == 
                             io::ErrorKind::TimedOut => {
@@ -349,6 +367,8 @@ impl<T: Read> SockWriterFdReader<T> {
     }
 }
 
+/// Returns a UnixStream with rw timeouts set or an  
+/// error, likely a WouldBlock if you have nonblocking set.
 #[inline(always)]
 fn stream_and_touts(
     listener: &UnixListener,
@@ -383,7 +403,7 @@ fn finish_check(conn: &SockStdInOutCon) -> bool {
 pub struct SockStream(UnixStream);
 
 impl SockStream {
-    pub fn get_auth_stream() -> DynError<Self> {
+    pub fn new() -> DynError<Self> {
         let path = env::var(SOCK_VAR)?;
         let sock = if fs::exists(&path)? {
             UnixStream::connect(&path)?
@@ -431,7 +451,7 @@ impl SockStream {
 pub struct SockListener(UnixListener);
 
 impl SockListener {
-    pub fn get_auth_sock() -> DynError<Self> {
+    pub fn new() -> DynError<Self> {
         let path = env::var(SOCK_VAR)?;
         let sock = if std::fs::exists(&path)? {
             return Err(anyhow!(
@@ -444,7 +464,6 @@ impl SockListener {
         let mut perms = fs::metadata(&path)?.permissions();
         perms.set_mode(0o777);
         fs::set_permissions(&path, perms)?;
-        sock.set_nonblocking(true)?;
         return Ok(Self(sock));
     }
 
@@ -459,7 +478,9 @@ impl SockListener {
         let (written, read) = (
             Arc::new(Mutex::new(written)),
             Arc::new(Mutex::new(read)));
-        let stream_ctrl = Arc::new(Mutex::new(stream_and_touts(&self.0)?));
+        let stream = self.0.accept()?.0;
+        self.0.set_nonblocking(true)?;
+        let stream_ctrl = Arc::new(Mutex::new(stream));
         let thread_ctrl = SockStdInOutCon::spawn(
             stream_ctrl.clone(),
             written.clone(),
@@ -468,6 +489,29 @@ impl SockListener {
         loop { 
             thread::sleep(SLEEP_DURATION_CTRL);
 
+            if thread_ctrl.broken_pipe.load(SeqCst) {
+                let stream = match stream_and_touts(&self.0) {
+                    Ok(stream) => stream,
+
+                    Err(err) if err.kind() == 
+                        io::ErrorKind::WouldBlock => continue,
+
+                    Err(err) => return Err(err.into()),
+                };
+
+                let Ok(mut stream_lock) = stream_ctrl.lock() else {
+                    let mutex_err = Err(anyhow!(MUTEX_ERR).into());
+                    debug_err_append(
+                        &mutex_err,
+                        DBG_FNAME_MAIN,
+                        ERR_LOG_DIR_NAME);
+                    return mutex_err;
+                }; 
+
+                *stream_lock = stream;
+                thread_ctrl.broken_pipe.store(false, SeqCst); 
+            }
+
             if finish_check(&thread_ctrl) {
                 let thread_err = Err(anyhow!(THREAD_ERR).into()); 
                 debug_err_append(
@@ -475,23 +519,6 @@ impl SockListener {
                     DBG_FNAME_MAIN,
                     ERR_LOG_DIR_NAME);
                 return thread_err;
-            }
-
-            if thread_ctrl.broken_pipe.load(SeqCst) {
-                let conn = match self.0.accept() {
-                    Ok(conn) => conn.0,
-                    Err(err) if err.kind() == 
-                        io::ErrorKind::WouldBlock => continue,
-                    Err(err) => return Err(err.into()),
-                };
-
-                let Ok(mut stream_lock) = stream_ctrl.lock() else {
-                    return Err(anyhow!(
-                        MUTEX_ERR).into());
-                }; 
-
-                *stream_lock = conn;
-                thread_ctrl.broken_pipe.store(false, SeqCst); 
             }
         };
     } 

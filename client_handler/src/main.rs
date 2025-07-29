@@ -1,7 +1,6 @@
 mod qrexec;
 
 use crate::qrexec::QRExecProc;
-use tokio::process::{ChildStdin, ChildStdout}; 
 use socket_stdinout::{
     self as sock,
     types::DynError,
@@ -11,46 +10,33 @@ use socket_stdinout::{
 
 const DEBUG_FNAME: &str = "Main";
 
-#[tokio::main]
-async fn main() {
+fn main() -> DynError<()> {
     let qrexec = {
-        let res = QRExecProc::new();
+        let qrexec_res = QRExecProc::new();
         debug_err_append(
-            &res,
+            &qrexec_res,
             DEBUG_FNAME,
-            ERR_LOG_DIR_NAME,
-        );
-        res.expect("Error: Failed to get qrexec proc..")
+            ERR_LOG_DIR_NAME);
+        qrexec_res?
     };
-
-    let (qchild_stdin, qchild_stdout) = (
-        ChildStdin::from_std(qrexec.stdin).expect(
-            "Error: Failed to produce async qrexec stdin."
-        ),
-        ChildStdout::from_std(qrexec.stdout).expect(
-            "Error: Failed to produce async qrexec stdout."
-        ),
-    );
 
     let stream = {
-        let res = sock::SockListener::get_auth_sock().await;
+        let stream_res = sock::SockListener::new();
         debug_err_append(
-            &res,
+            &stream_res,
             DEBUG_FNAME,
-            ERR_LOG_DIR_NAME,
-        );
-        res.expect("Error: failed to get_auth_sock")
+            ERR_LOG_DIR_NAME);
+        stream_res?
     };
 
-    let con_res = stream.handle_connections(
-        qchild_stdin,
-        qchild_stdout,
-    ).await;
-
+    let conn_res = stream.handle_connections(
+        qrexec.stdin,
+        qrexec.stdout);
     debug_err_append(
-        &con_res,
+        &conn_res,
         DEBUG_FNAME,
-        ERR_LOG_DIR_NAME,
-    );
-    con_res.expect("Error: handle_connections returned");
+        ERR_LOG_DIR_NAME);
+    conn_res?;
+
+    return Ok(());
 }

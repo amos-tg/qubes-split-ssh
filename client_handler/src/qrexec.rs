@@ -14,8 +14,7 @@ use std::{
         Stdio,
         Child,
         ChildStdout,
-        ChildStdin,
-        Command,
+        ChildStdin, Command,
     },
 };
 
@@ -66,6 +65,11 @@ pub struct QRExecProc {
 impl QRExecProc {
     const VAULT_VM_NAME_ENV_VAR: &str = "SSH_VAULT_VM";
     const RPC_SERVICE_NAME: &str = "qubes.SplitSSHAgent";
+    const STDIN_ERR: &str = "Error: failed to produce a stdin \
+        for qrexec child proc.";
+    const STDOUT_ERR: &str = "Error: failed to produce a stdout \
+        for qrexec child proc.";
+
     pub fn new() -> DynError<Self> { 
         let remote_vm = {
             let var = env::var(Self::VAULT_VM_NAME_ENV_VAR);
@@ -89,16 +93,9 @@ impl QRExecProc {
         );
 
         let stdin = child.stdin.take().ok_or(
-            anyhow!(
-                "Error: failed to produce a stdin for qrexec child proc."
-            )
-        )?;
-
+            anyhow!(Self::STDIN_ERR))?;
         let stdout = child.stdout.take().ok_or(
-            anyhow!(
-                "Error: failed to produce a for qrexec child proc."
-            )
-        )?;
+            anyhow!(Self::STDOUT_ERR))?;
 
         return Ok(Self {
             _child: child, 
