@@ -14,7 +14,9 @@ use std::{
         Stdio,
         Child,
         ChildStdout,
-        ChildStdin, Command,
+        ChildStdin, 
+        ChildStderr,
+        Command,
     },
 };
 
@@ -56,6 +58,7 @@ pub struct QRExecProc {
     _child: DropChild,
     pub stdin: ChildStdin,
     pub stdout: ChildStdout,
+    pub stderr: ChildStderr,
 }
 
 // I am aware that qrexec-client-vm takes a local program argument
@@ -63,16 +66,18 @@ pub struct QRExecProc {
 // does for process::ChildStdin. 
 
 impl QRExecProc {
-    const VAULT_VM_NAME_ENV_VAR: &str = "SSH_VAULT_VM";
+    const VAULT_VM_NAME_ENV: &str = "SSH_VAULT_VM";
     const RPC_SERVICE_NAME: &str = "qubes.SplitSSHAgent";
     const STDIN_ERR: &str = "Error: failed to produce a stdin \
         for qrexec child proc.";
     const STDOUT_ERR: &str = "Error: failed to produce a stdout \
         for qrexec child proc.";
+    const STDERR_ERR: &str = "Error: failed to produce a stderr \
+        for qrexec child proc.";
 
     pub fn new() -> DynError<Self> { 
         let remote_vm = {
-            let var = env::var(Self::VAULT_VM_NAME_ENV_VAR);
+            let var = env::var(Self::VAULT_VM_NAME_ENV);
             debug_err_append(
                 &var,
                 DEBUG_FNAME,
@@ -96,11 +101,13 @@ impl QRExecProc {
             anyhow!(Self::STDIN_ERR))?;
         let stdout = child.stdout.take().ok_or(
             anyhow!(Self::STDOUT_ERR))?;
-
+        let stderr = child.stderr.take().ok_or(
+            anyhow!(Self::STDERR_ERR))?;
         return Ok(Self {
             _child: child, 
             stdin,
             stdout,
+            stderr,
         });
     }
 }

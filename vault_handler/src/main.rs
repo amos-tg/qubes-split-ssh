@@ -1,3 +1,4 @@
+// why isn't it erring if SSH_AUTH_SOCK Is unset?
 use std::io;
 
 use socket_stdinout::{
