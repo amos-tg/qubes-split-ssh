@@ -156,6 +156,7 @@ impl<T: Write> SockReaderFdWriter<T> {
                         io::ErrorKind::ConnectionReset => {
                         self.reset_conn.store(true, SeqCst);
                         drop(stream);
+                        while self.reset_conn.load(SeqCst) {}
                         stream_res = self.stream.lock();
                         debug_err_append(
                             &stream_res,
@@ -182,24 +183,31 @@ impl<T: Write> SockReaderFdWriter<T> {
                 &MsgHeader::new(cursor as u64).0);
             buf_len = cursor;
 
-            let fd = self.fd.lock();
+            let mut fd_res = self.fd.lock();
             debug_err_append(
-                &fd,
+                &fd_res,
                 Self::DEBUG_FNAME,
                 ERR_LOG_DIR_NAME);
-            let mut fd = fd.unwrap();
+            let mut fd = fd_res.unwrap();
 
             cursor = 0;
             while cursor < buf_len {
                 match fd.write(&buf[cursor..buf_len]) {
                     Ok(n_bytes) => cursor += n_bytes,
-
                     Err(err) if err.kind() ==
                         io::ErrorKind::Interrupted => continue,
-
-                    //Err(err) if err.kind() == 
-                    //    io::ErrorKind::BrokenPipe => 
-
+                    Err(err) if err.kind() == 
+                        io::ErrorKind::BrokenPipe => {
+                        self.reset_conn.store(true, SeqCst);
+                        drop(fd);
+                        while self.reset_conn.load(SeqCst) {}
+                        fd_res = self.fd.lock();
+                        debug_err_append(
+                            &fd_res,
+                            Self::DEBUG_FNAME,
+                            ERR_LOG_DIR_NAME);
+                        fd = fd_res.unwrap();
+                    }
                     Err(err) => {
                         debug_err_append(
                             &Err::<T, io::Error>(err),
@@ -250,7 +258,7 @@ impl<T: Read> SockWriterFdReader<T> {
                 panic!("{}", Self::MSG_KILL_TRIG) 
             }
 
-            let fd_res = self.fd.lock();
+            let mut fd_res = self.fd.lock();
             debug_err_append(
                 &fd_res,
                 Self::DEBUG_FNAME,
@@ -266,15 +274,23 @@ impl<T: Read> SockWriterFdReader<T> {
             while cursor < HEADER_LEN {
                 match fd.read(&mut buf[cursor..]) {
                     Ok(nb) => cursor += nb, 
-
-                    Err(err) if err.kind() == 
-                        io::ErrorKind::Interrupted => {
-
-                    }
-
-                    Err(err) => {
+                    Err(e) if e.kind() == 
+                        io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == 
+                        io::ErrorKind::ConnectionReset => {
+                        self.reset_conn.store(true, SeqCst);
+                        drop(fd);
+                        while self.reset_conn.load(SeqCst) {}
+                        fd_res = self.fd.lock();
                         debug_err_append(
-                            &Err::<(), io::Error>(err),
+                            &fd_res,
+                            Self::DEBUG_FNAME,
+                            ERR_LOG_DIR_NAME);
+                        fd = fd_res.unwrap();
+                    }
+                    Err(e) => {
+                        debug_err_append(
+                            &Err::<(), io::Error>(e),
                             Self::DEBUG_FNAME,
                             ERR_LOG_DIR_NAME);
                         cursor = 0;
@@ -291,16 +307,23 @@ impl<T: Read> SockWriterFdReader<T> {
             while (cursor as u64) < msg_len {
                 match fd.read(&mut buf[cursor..]) {
                     Ok(nb) => cursor += nb,
-
-                    Err(err) if err.kind() ==
+                    Err(e) if e.kind() ==
                         io::ErrorKind::Interrupted => continue,
-
-                    //Err(err) if err.kind() == 
-                    //    io::ErrorKind::BrokenPipe =>
-
-                    Err(err) => {
+                    Err(e) if e.kind() == 
+                        io::ErrorKind::ConnectionReset => {
+                        self.reset_conn.store(true, SeqCst);
+                        drop(fd);
+                        while self.reset_conn.load(SeqCst) {}
+                        fd_res = self.fd.lock();
                         debug_err_append(
-                            &Err::<(), io::Error>(err),
+                            &fd_res,
+                            Self::DEBUG_FNAME,
+                            ERR_LOG_DIR_NAME);
+                        fd = fd_res.unwrap();
+                    }
+                    Err(e) => {
+                        debug_err_append(
+                            &Err::<(), io::Error>(e),
                             Self::DEBUG_FNAME,
                             ERR_LOG_DIR_NAME);
                         cursor = 0;
@@ -332,7 +355,7 @@ impl<T: Read> SockWriterFdReader<T> {
                         cursor += nb;
                         continue;
                     }
-                    Err(ref e) if e.kind() ==
+                    Err(e) if e.kind() ==
                         io::ErrorKind::WouldBlock => {
                         drop(stream);
                         stream_res = self.stream.lock();
@@ -343,7 +366,7 @@ impl<T: Read> SockWriterFdReader<T> {
                         stream = stream_res.unwrap();
                         continue;
                     }
-                    Err(ref e) if e.kind() ==
+                    Err(e) if e.kind() ==
                         io::ErrorKind::Interrupted => {
                         drop(stream);
                         stream_res = self.stream.lock();
@@ -353,6 +376,18 @@ impl<T: Read> SockWriterFdReader<T> {
                             ERR_LOG_DIR_NAME);
                         stream = stream_res.unwrap();
                         continue;
+                    }
+                    Err(e) if e.kind() ==
+                        io::ErrorKind::BrokenPipe => {
+                        self.reset_conn.store(true, SeqCst);
+                        drop(stream);
+                        while self.reset_conn.load(SeqCst) {}
+                        stream_res = self.stream.lock();
+                        debug_err_append(
+                            &stream_res,
+                            Self::DEBUG_FNAME,
+                            ERR_LOG_DIR_NAME);
+                        stream = stream_res.unwrap();
                     }
                     Err(e) => {
                         debug_err_append(
