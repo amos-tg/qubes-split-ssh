@@ -45,6 +45,7 @@ impl<'a> SockStdInOutCon {
         stream: Arc<Mutex<UnixStream>>,
         written: Arc<Mutex<T>>,
         read: Arc<Mutex<U>>,
+        model: Model,
     ) -> Self where
         T: Write + Send + Sync + 'static,
         U: Read + Send + Sync + 'static,
@@ -58,6 +59,7 @@ impl<'a> SockStdInOutCon {
                 fd: written.clone(),
                 kill: kill.clone(),
                 reset_conn: reset_conn.clone(),
+                model: model.clone(),
             };
 
             thread::Builder::new()
@@ -72,6 +74,7 @@ impl<'a> SockStdInOutCon {
                 fd: read.clone(),
                 kill: kill.clone(),
                 reset_conn: reset_conn.clone(),
+                model,
             };
 
             thread::Builder::new()
@@ -95,11 +98,27 @@ impl Drop for SockStdInOutCon {
     }
 }
 
+#[derive(Clone, Debug)]
+enum Model {
+    Client,
+    Vault,
+}
+
+impl Model {
+    const QREXEC_EPIPE: &str = 
+        "Error: Qrexec has shutdown the connection \
+        to the remote_vm, EPIPE"; 
+    const QREXEC_ECONNRESET: &str = 
+        "Error: Qrexec has shutdown the connection \
+        to the remote_vm, ECONNRESET";
+}
+
 struct SockReaderFdWriter<T: Write> {
     stream: Arc<Mutex<UnixStream>>,
     fd: Arc<Mutex<T>>,
     kill: Arc<AtomicBool>,   
     reset_conn: Arc<AtomicBool>,
+    model: Model,
 }
 
 impl<T: Write> SockReaderFdWriter<T> {
@@ -129,7 +148,7 @@ impl<T: Write> SockReaderFdWriter<T> {
                             break;
                         } else { continue; }
                     }
-                    Err(ref e) if e.kind() ==
+                    Err(e) if e.kind() ==
                         io::ErrorKind::WouldBlock => {
                         if cursor > 0 { break; }
                         drop(stream);
@@ -141,7 +160,7 @@ impl<T: Write> SockReaderFdWriter<T> {
                         stream = stream_res.unwrap();
                         continue;
                     }
-                    Err(ref e) if e.kind() ==
+                    Err(e) if e.kind() ==
                         io::ErrorKind::Interrupted => {
                         drop(stream);
                         stream_res = self.stream.lock();
@@ -152,17 +171,30 @@ impl<T: Write> SockReaderFdWriter<T> {
                         stream = stream_res.unwrap();
                         continue;
                     }
-                    Err(ref e) if e.kind() == 
+                    Err(e) if e.kind() == 
                         io::ErrorKind::ConnectionReset => {
-                        self.reset_conn.store(true, SeqCst);
-                        drop(stream);
-                        while self.reset_conn.load(SeqCst) {}
-                        stream_res = self.stream.lock();
-                        debug_err_append(
-                            &stream_res,
-                            Self::DEBUG_FNAME,
-                            ERR_LOG_DIR_NAME);
-                        stream = stream_res.unwrap();
+                        match self.model {
+                            Model::Client => {
+                                let _ = self.reset_conn.compare_exchange(
+                                    false, true, SeqCst, SeqCst);
+                                drop(stream);
+                                while self.reset_conn.load(SeqCst){}
+                                stream_res = self.stream.lock();
+                                debug_err_append(
+                                    &stream_res,
+                                    Self::DEBUG_FNAME,
+                                    ERR_LOG_DIR_NAME);
+                                stream = stream_res.unwrap();
+                            } 
+                            Model::Vault => {
+                                let msg = e.to_string();
+                                debug_err_append(
+                                    &Err::<T, io::Error>(e),
+                                    Self::DEBUG_FNAME,
+                                    ERR_LOG_DIR_NAME);
+                                panic!("{}", msg);
+                            }
+                        }
                     }
                     Err(e) => {
                         debug_err_append(
@@ -183,7 +215,7 @@ impl<T: Write> SockReaderFdWriter<T> {
                 &MsgHeader::new(cursor as u64).0);
             buf_len = cursor;
 
-            let mut fd_res = self.fd.lock();
+            let fd_res = self.fd.lock();
             debug_err_append(
                 &fd_res,
                 Self::DEBUG_FNAME,
@@ -198,15 +230,29 @@ impl<T: Write> SockReaderFdWriter<T> {
                         io::ErrorKind::Interrupted => continue,
                     Err(err) if err.kind() == 
                         io::ErrorKind::BrokenPipe => {
-                        self.reset_conn.store(true, SeqCst);
-                        drop(fd);
-                        while self.reset_conn.load(SeqCst) {}
-                        fd_res = self.fd.lock();
-                        debug_err_append(
-                            &fd_res,
-                            Self::DEBUG_FNAME,
-                            ERR_LOG_DIR_NAME);
-                        fd = fd_res.unwrap();
+                        self.kill.store(true, SeqCst);        
+                        let msg = Model::QREXEC_EPIPE;
+                        debug_err_append(                     
+                            &Err::<T, anyhow::Error>(anyhow!( 
+                                "{}", msg)),    
+                            Self::DEBUG_FNAME,                
+                            ERR_LOG_DIR_NAME);                
+                        panic!("{}", msg);      
+                        // template for future qrexec reloads 
+                        //match self.model { 
+                        //    //Model::Client => { 
+                        //    //   QRExec reloading signalling behavior here 
+                        //    //}
+                        //    //Model::Vault => {
+                        //    //    self.kill.store(true, SeqCst); 
+                        //    //    debug_err_append(
+                        //    //        &Err::<T, anyhow::Error>(anyhow!(
+                        //    //            "{}", Model::QREXEC_ERR)),
+                        //    //        Self::DEBUG_FNAME,
+                        //    //        ERR_LOG_DIR_NAME);
+                        //    //    panic!("{}", Model::QREXEC_ERR);
+                        //    //}
+                        //} 
                     }
                     Err(err) => {
                         debug_err_append(
@@ -228,16 +274,17 @@ impl<T: Write> SockReaderFdWriter<T> {
     }
 }
 
+struct OFIdx {
+    start: usize, 
+    end: usize,
+}
+
 struct SockWriterFdReader<T: Read> {
     stream: Arc<Mutex<UnixStream>>,
     fd: Arc<Mutex<T>>, 
     kill: Arc<AtomicBool>,
     reset_conn: Arc<AtomicBool>,
-}
-
-struct OFIdx {
-    start: usize, 
-    end: usize,
+    model: Model,
 }
 
 impl<T: Read> SockWriterFdReader<T> {
@@ -258,7 +305,7 @@ impl<T: Read> SockWriterFdReader<T> {
                 panic!("{}", Self::MSG_KILL_TRIG) 
             }
 
-            let mut fd_res = self.fd.lock();
+            let fd_res = self.fd.lock();
             debug_err_append(
                 &fd_res,
                 Self::DEBUG_FNAME,
@@ -278,15 +325,13 @@ impl<T: Read> SockWriterFdReader<T> {
                         io::ErrorKind::Interrupted => continue,
                     Err(e) if e.kind() == 
                         io::ErrorKind::ConnectionReset => {
-                        self.reset_conn.store(true, SeqCst);
-                        drop(fd);
-                        while self.reset_conn.load(SeqCst) {}
-                        fd_res = self.fd.lock();
+                        self.kill.store(true, SeqCst);
+                        let msg = Model::QREXEC_ECONNRESET;
                         debug_err_append(
-                            &fd_res,
+                            &Err::<T, anyhow::Error>(anyhow!(msg)),
                             Self::DEBUG_FNAME,
                             ERR_LOG_DIR_NAME);
-                        fd = fd_res.unwrap();
+                        panic!("{}", msg);
                     }
                     Err(e) => {
                         debug_err_append(
@@ -311,15 +356,13 @@ impl<T: Read> SockWriterFdReader<T> {
                         io::ErrorKind::Interrupted => continue,
                     Err(e) if e.kind() == 
                         io::ErrorKind::ConnectionReset => {
-                        self.reset_conn.store(true, SeqCst);
-                        drop(fd);
-                        while self.reset_conn.load(SeqCst) {}
-                        fd_res = self.fd.lock();
+                        self.kill.store(true, SeqCst);
+                        let msg = Model::QREXEC_ECONNRESET;
                         debug_err_append(
-                            &fd_res,
+                            &Err::<T, anyhow::Error>(anyhow!(msg)),
                             Self::DEBUG_FNAME,
                             ERR_LOG_DIR_NAME);
-                        fd = fd_res.unwrap();
+                        panic!("{}", msg);
                     }
                     Err(e) => {
                         debug_err_append(
@@ -379,15 +422,30 @@ impl<T: Read> SockWriterFdReader<T> {
                     }
                     Err(e) if e.kind() ==
                         io::ErrorKind::BrokenPipe => {
-                        self.reset_conn.store(true, SeqCst);
-                        drop(stream);
-                        while self.reset_conn.load(SeqCst) {}
-                        stream_res = self.stream.lock();
-                        debug_err_append(
-                            &stream_res,
-                            Self::DEBUG_FNAME,
-                            ERR_LOG_DIR_NAME);
-                        stream = stream_res.unwrap();
+                        match self.model {
+                            Model::Client => {
+                                let _ = self.reset_conn.compare_exchange(
+                                    false, true, SeqCst, SeqCst);
+                                drop(stream);
+                                while self.reset_conn.load(SeqCst){}
+                                stream_res = self.stream.lock();
+                                debug_err_append(
+                                    &stream_res,
+                                    Self::DEBUG_FNAME,
+                                    ERR_LOG_DIR_NAME);
+                                stream = stream_res.unwrap();
+                                continue;
+                            }
+                            Model::Vault => {
+                                self.kill.store(true, SeqCst);
+                                let msg = e.to_string();
+                                debug_err_append(
+                                    &Err::<T, io::Error>(e),
+                                    Self::DEBUG_FNAME,
+                                    ERR_LOG_DIR_NAME);
+                                panic!("{}", msg);
+                            }
+                        }
                     }
                     Err(e) => {
                         debug_err_append(
@@ -442,6 +500,7 @@ fn finish_check(conn: &SockStdInOutCon) -> bool {
 pub struct SockStream(UnixStream);
 
 impl SockStream {
+    // SockStream is used on the vault side
     pub fn new() -> DynError<Self> {
         let path = env::var(SOCK_VAR)?;
         let sock = if fs::exists(&path)? {
@@ -470,7 +529,8 @@ impl SockStream {
         let ctrl = SockStdInOutCon::spawn(
             Arc::new(Mutex::new(self.0)),
             written,
-            read);
+            read,
+            Model::Vault);
 
         loop {
             if finish_check(&ctrl) { 
@@ -488,6 +548,7 @@ impl SockStream {
 pub struct SockListener(UnixListener);
 
 impl SockListener {
+    // used by the client side
     pub fn new() -> DynError<Self> {
         let path = env::var(SOCK_VAR)?;
         let sock = if std::fs::exists(&path)? {
@@ -512,7 +573,6 @@ impl SockListener {
         T: Write + Send + Sync + 'static,
         U: Read + Send + Sync + 'static, 
     {
-        const STREAM_ERR: &str = "Error: failed stream_and_touts, within SockStdInOutCon thread management"; 
         let (written, read) = (
             Arc::new(Mutex::new(written)),
             Arc::new(Mutex::new(read)));
@@ -522,10 +582,13 @@ impl SockListener {
         let thread_ctrl = SockStdInOutCon::spawn(
             stream_ctrl.clone(),
             written.clone(),
-            read.clone());
+            read.clone(),
+            Model::Client);
 
         loop { 
-            //thread::sleep(SLEEP_DURATION_CTRL);
+            if finish_check(&thread_ctrl) {
+                Err(anyhow!(THREAD_ERR))? 
+            }
 
             if thread_ctrl.reset_conn.load(SeqCst) {
                 let stream = match stream_and_touts(&self.0) {
@@ -533,34 +596,16 @@ impl SockListener {
                     Err(err) if err.kind() == 
                         io::ErrorKind::WouldBlock => continue,
                     Err(err) => {
-                        debug_err_append(
-                            &Err::<T, io::Error>(err),
-                            DBG_FNAME_MAIN,
-                            ERR_LOG_DIR_NAME);
-                        panic!("{}", STREAM_ERR);
+                        Err(err)?
                     }
                 };
 
                 let Ok(mut stream_lock) = stream_ctrl.lock() else {
-                    let mutex_err = Err(anyhow!(MUTEX_ERR).into());
-                    debug_err_append(
-                        &mutex_err,
-                        DBG_FNAME_MAIN,
-                        ERR_LOG_DIR_NAME);
-                    return mutex_err;
-                }; 
+                    Err(anyhow!(MUTEX_ERR))?
+                };
 
                 *stream_lock = stream;
                 thread_ctrl.reset_conn.store(false, SeqCst); 
-            }
-
-            if finish_check(&thread_ctrl) {
-                let thread_err = Err(anyhow!(THREAD_ERR).into()); 
-                debug_err_append(
-                    &thread_err,
-                    DBG_FNAME_MAIN,
-                    ERR_LOG_DIR_NAME);
-                return thread_err;
             }
         };
     } 
