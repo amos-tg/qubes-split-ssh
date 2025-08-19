@@ -146,7 +146,19 @@ impl<T: Write> SockReaderFdWriter<T> {
                             continue;
                         } else if cursor > HEADER_LEN {
                             break;
-                        } else { continue; }
+                        } else { 
+                            let _ = self.reset_conn.compare_exchange(
+                                false, true, SeqCst, SeqCst);
+                            drop(stream);
+                            while self.reset_conn.load(SeqCst){}
+                            stream_res = self.stream.lock();
+                            debug_err_append(
+                                &stream_res,
+                                Self::DEBUG_FNAME,
+                                ERR_LOG_DIR_NAME);
+                            stream = stream_res.unwrap();
+                            continue; 
+                        }
                     }
                     Err(e) if e.kind() ==
                         io::ErrorKind::WouldBlock => {
@@ -320,7 +332,11 @@ impl<T: Read> SockWriterFdReader<T> {
 
             while cursor < HEADER_LEN {
                 match fd.read(&mut buf[cursor..]) {
-                    Ok(nb) => cursor += nb, 
+                    Ok(nb) => {
+                        if nb != 0 {
+                            cursor += nb; 
+                        } 
+                    }
                     Err(e) if e.kind() == 
                         io::ErrorKind::Interrupted => continue,
                     Err(e) if e.kind() == 
@@ -351,7 +367,11 @@ impl<T: Read> SockWriterFdReader<T> {
             msg_len = MsgHeader::len(header); 
             while (cursor as u64) < msg_len {
                 match fd.read(&mut buf[cursor..]) {
-                    Ok(nb) => cursor += nb,
+                    Ok(nb) => { 
+                        if nb != 0 {
+                            cursor += nb;
+                        } 
+                    } 
                     Err(e) if e.kind() ==
                         io::ErrorKind::Interrupted => continue,
                     Err(e) if e.kind() == 
