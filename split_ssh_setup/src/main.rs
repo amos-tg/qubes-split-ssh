@@ -3,6 +3,7 @@ pub mod dom0_files;
 pub mod client_files;
 pub mod server_files;
 pub mod hefty_misc;
+pub mod msgs;
 
 use std::{
     collections::HashMap, fs,
@@ -12,12 +13,13 @@ use std::{
     process::{Command, Stdio},
     str::from_utf8,
 };
-
-use crate::make_vm::{
-    gen_vms,
-    deps, 
+use crate::{
+    make_vm::{
+        gen_vms,
+        deps, 
+    },
+    msgs::Main,
 };
-
 use anyhow::anyhow;
 
 pub type DynRes<T> = Result<T, Box<dyn Error>>;
@@ -26,61 +28,53 @@ const TMP_DIR: &str = "/tmp/split-ssh-1820912";
 const STATE_DIR: &str = "/srv/salt";
 const SALT_FILES_DIR: &str = "/srv/salt/files";
 
-/// since all the files are going in the same dir,
-/// at the end of setup add all to a top file then
-/// execute at once after top.enable'ment.
 fn main() -> DynRes<()> {
     let stdin = io::stdin(); 
     let mut stdout = io::stdout();
 
     let file_roots = get_file_roots()?; 
-
     let states_dir = get_custom_dir(
         &mut stdout,
         &stdin,
-        "\n\nDo you want to use a custom directory to store your VM Salt states (it needs to be inside file_roots with no trailing /)?\n\nLeave blank for no otherwise insert the absolute path; If you are unsure leave this blank: ",
-    )?;
+        Main::STATES_DIR_MSG)?;
 
     let files_dir = get_custom_dir(
         &mut stdout,
         &stdin,
-        "\n\nDo you want to use a custom directory to store your files managed by salt (it needs to be inside file_roots with no trailing /)?\n\n Leave blank for no otherwise insert the absolute path; If you are unsure leave this blank: ",
-    )?;
+        Main::FILES_DIR_MSG)?;
 
     init_dirs(
        &files_dir, 
-       &states_dir
-    )?;
+       &states_dir)?;
 
     let vm_names = gen_vms(
         &stdin,
-        &mut stdout,
-    )?;
+        &mut stdout)?;
 
     let mut states = Vec::new();
 
     for state in deps(
         &states_dir,
         &vm_names,
-        &file_roots
-    )? {
+        &file_roots)? 
+    {
         states.push(state);
     }
 
-    states.push(dom0_files::maint_files(
-        &vm_names,
-        &files_dir,
-        &file_roots,
-    )?);
+    states.push(
+        dom0_files::maint_files(
+            &vm_names,
+            &files_dir,
+            &file_roots)?);
 
-    states.push(client_files::maint_files(
-        &mut stdout,
-        &stdin,
-        &vm_names,
-        &files_dir,
-        &states_dir,
-        &file_roots,
-    )?);
+    states.push(
+        client_files::maint_files(
+            &mut stdout,
+            &stdin,
+            &vm_names,
+            &files_dir,
+            &states_dir,
+            &file_roots)?);
 
     for state in server_files::maint_files(
         &mut stdout,
@@ -88,16 +82,15 @@ fn main() -> DynRes<()> {
         &vm_names,
         &files_dir,
         &states_dir,
-        &file_roots,
-    )? {
+        &file_roots)? 
+    {
         states.push(state);
     }
 
     SlsVmComplement::execute_as_top(
         states,
         &states_dir,
-        &file_roots,
-    )?;
+        &file_roots)?;
 
     return Ok(());
 }
@@ -155,7 +148,9 @@ fn get_custom_dir(
 }
 
 /// verifies that a directory is in the salt file_roots and returns it with
-/// the proper salt pathing for file formatting example:  
+/// the proper salt pathing for file formatting. 
+/// 
+/// example:  
 ///
 /// passed in : /srv/salt/file/configuration-file.txt
 ///
@@ -167,7 +162,7 @@ pub fn parse_verify_file(
     file_roots: &Vec<String>,
 ) -> DynRes<String> {
     let path = verify_roots(&file_path, file_roots)?;
-    return Ok(dbg!(["salt:/", &path].join("")));
+    return Ok(["salt:/", &path].join(""));
 }  
 
 /// verifies that a state.sls is in the salt file_roots and returns it 
@@ -180,58 +175,56 @@ pub fn parse_verify_state(
     file_path: String,
     file_roots: &Vec<String>,
 ) -> DynRes<String> {
+    const FSLASH_PREFIX_ERR: &str = 
+        "Error: path does not start with /";
+    const STRIP_ERR: &str = 
+        "Error: path.strip_suffix(\".sls\"), returned None";
+
     let path = verify_roots(&file_path, file_roots)?;
 
-    if path.find('/').ok_or(anyhow!(
-        "Error: this should start with a / and it doesn't."
-    ))? != 0 { 
-        err!("Error: this should start with a / and it doesn't.");
-    } 
+    if !path.starts_with('/') {
+        err!(FSLASH_PREFIX_ERR);
+    }
 
-    return Ok(dbg!(path[1..]
-            .replace("/", ".")
-            .split(".sls")
-            .next()
-            .ok_or(anyhow!(
-"Error: file_path {file_path}, returned None from split(\".sls\").next()"
-            ))?
-            .to_string()
-    ));
+    let path = path
+            .replace('/', ".")
+            .strip_suffix(".sls").ok_or(anyhow!(STRIP_ERR))?
+            .to_string();
+
+    return Ok(path);
 }
 
 fn get_file_roots() -> DynRes<Vec<String>> {
+    const FILE_ROOTS_ERR: &str = 
+        "Error: Failed to pull the file roots";
+    
     let file_roots = Command::new("qubesctl")
-        .args([
-            "config.get",
-            "file_roots",
-        ])
-        .output()?
-    ;
+        .args(["config.get", "file_roots"])
+        .output()?;
 
     if !from_utf8(&file_roots.stderr)?.is_empty() {
-        err!("Error: Failed to pull the file roots");
+        err!(FILE_ROOTS_ERR);
     }
 
     let file_roots = from_utf8(&file_roots.stdout)?
         .lines()
-        .filter(|line| line.contains("- /"))
-        .map(|line| line
-            .split_at(
-            line
+        .filter(|line| line.trim().starts_with("- /"))
+        .map(|line| {
+            let delim = line
                 .find('-')
                 .unwrap()
-                +1
-            )
-            .1
-            .trim()
-            .split('\u{1b}')
-            .collect::<Vec<&str>>()[0]
-            .to_string()
-        )
-        .collect::<Vec<String>>()
-    ;
+                +1;
 
-    return Ok(dbg!(file_roots));
+            let tformed = line.split_at(delim).1
+                .trim()
+                .split('\u{1b}')
+                .collect::<Vec<&str>>()[0]
+                .to_string();
+
+            return tformed;
+        }).collect::<Vec<String>>();
+
+    return Ok(file_roots);
 }
 
 /// err's if the file is not in file roots.
@@ -240,64 +233,47 @@ fn verify_roots(
     file_path: &String,
     file_roots: &Vec<String>,
 ) -> DynRes<String> {
+    const FROOT_ERR: &str =  
+        "Error: file_path did not start with a file_root";
+
     for file_root in file_roots {
-        if file_path.contains(file_root) {
-            return Ok(file_path
-                .split(file_root)
-                .last()
-                .ok_or(anyhow!(
-                    "Error: file_path: {file_path} was unsplittable at {file_root}"
-                ))?
-                .to_string()
-            );
+        if file_path.starts_with(file_root) {
+            return Ok(
+                file_path
+                    .split(file_root)
+                    .last()
+                    .unwrap()
+                    .to_string());
         } 
     }
 
-    err!(format!("Error file_path: {file_path} was not in the salt file_roots!"));
+    err!(FROOT_ERR);
 }
 
+/// makes sure that TMP_DIR, file_dir, and state_dir exist in the filesystem.
 pub fn init_dirs(
     file_dir: &Option<String>,
     state_dir: &Option<String>,
 ) -> DynRes<()> {
-    if !fs::exists(TMP_DIR)? {
-        fs::create_dir(TMP_DIR)?;
-    }
+    const DIR_NAME: &str = "split-ssh";
+    fs::create_dir_all(TMP_DIR)?;
 
-    let mut storage_dir;
-    if let Some(dir) = file_dir {
-        if !fs::exists(dir)? {
-            fs::create_dir(dir)?;
-        }
-        storage_dir = dir.to_string();
+    let mut dir;
+    if let Some(d) = file_dir {
+        dir = d.to_string();
     } else {
-        if !fs::exists(SALT_FILES_DIR)? {
-            fs::create_dir(SALT_FILES_DIR)?;
-        }
-        storage_dir = SALT_FILES_DIR.to_string();
+        dir = SALT_FILES_DIR.to_string();
     }
+    dir = format!("{dir}/{DIR_NAME}");
+    fs::create_dir_all(&dir)?;
 
-    let file_storage_dir = format!("{storage_dir}/split-ssh");
-    if !fs::exists(&file_storage_dir)? {
-        fs::create_dir(&file_storage_dir)?;
-    }
-
-    if let Some(dir) = state_dir {
-        if !fs::exists(dir)? {
-            fs::create_dir(dir)?;
-        }
-        storage_dir = dir.to_string();
+    if let Some(d) = state_dir {
+        dir = d.to_string();
     } else {
-        if !fs::exists(STATE_DIR)? {
-            fs::create_dir(STATE_DIR)?;
-        }
-        storage_dir = STATE_DIR.to_string();
+        dir = STATE_DIR.to_string();
     }
-
-    let file_storage_dir = format!("{storage_dir}/split-ssh");
-    if !fs::exists(&file_storage_dir)? {
-        fs::create_dir(&file_storage_dir)?;
-    }
+    dir = format!("{dir}/{DIR_NAME}");
+    fs::create_dir_all(&dir)?;
 
     return Ok(());
 }
@@ -307,7 +283,7 @@ macro_rules! err {
     ($msg:expr) => {
         #[cfg(debug_assertions)]
         return Err(anyhow!(
-            "{}, backtrace: {}", 
+            "{}\n\nbacktrace: {}", 
             $msg, 
             std::backtrace::Backtrace::capture(),
         ).into());

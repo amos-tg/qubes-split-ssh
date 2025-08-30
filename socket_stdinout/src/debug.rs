@@ -4,23 +4,18 @@ use std::{
     io::Write,
 };
 
-/// sends errors over the channel
-/// (error: Error, sender: Sender<T>)
-#[macro_export] 
-macro_rules! cerr {
-    ($err:expr, $sender:expr) => {
-        match $err {
-            Err(e) => {
-                $sender.send(e)
-                    .expect(&format!(
-                        "Error: failed to send err_msg; {}",
-                        e.to_string()));
-                continue;
-            }
-            Ok(thing) => thing,
-        }
-    };
-}
+const GET_XDG_DIR_ERR: &str = 
+    "Error: debug_append, xdg_dir";
+const FS_EXISTS_ERR: &str = 
+    "Error: debug_append, failed dir exists";
+const CREATE_DIR_ALL_ERR: &str = 
+    "Error: debug_append, failed dir creation";
+const OO_FOPEN_ERR: &str = 
+    "Error: debug_append, failed file open";
+const WRITE_ALL_ERR: &str = 
+    "Error: debug_append, file write_all";
+const WRITE_FMT_ERR: &str = 
+    "Error: debug_err_append, write_fmt";
 
 #[macro_export]
 macro_rules! err {
@@ -36,22 +31,20 @@ fn get_xdg_state_dir(
     dir_name: impl std::fmt::Display
 ) -> DynError<String> {
     const XDG_VAR: &str = "XDG_STATE_HOME";     
-    const ALT_VAR: &str = "HOME";
-    const ALT_POSTFIX: &str = /*$HOME*/".local/state";
+    const DEFAULT_VAR: &str = "HOME";
+    const DEFAULT_POSTFIX: &str = /*$HOME*/".local/state";
 
-    let dir = if let Ok(dir) = std::env::var(XDG_VAR) {
-        dir
+    let dir;
+    if let Ok(xdg_dir) = std::env::var(XDG_VAR) {
+        dir = format!("{}/{}", xdg_dir, dir_name);
     } else {
-        format!(
-            "{}/{ALT_POSTFIX}/{}",
-            std::env::var(ALT_VAR)?,
+        dir = format!(
+            "{}/{}/{}",
+            std::env::var(DEFAULT_VAR)?,
+            DEFAULT_POSTFIX,
             dir_name,
-        )
+        );
     };
-
-    if !std::fs::exists(&dir)? {
-        std::fs::create_dir_all(&dir)?;
-    }
 
     return Ok(dir);
 }
@@ -62,15 +55,14 @@ pub fn debug_append(
     fname: impl AsRef<str>,
     dir_name: impl AsRef<str>,
 ) {
-    let dir = get_xdg_state_dir(dir_name.as_ref())
-        .expect("Error: debug_append, xdg_dir");
 
-    if !std::fs::exists(&dir)
-        .expect("Error: debug_append, failed dir exists")
+    let dir = get_xdg_state_dir(dir_name.as_ref())
+        .expect(GET_XDG_DIR_ERR);
+
+    if !std::fs::exists(&dir).expect(FS_EXISTS_ERR)
     {
         std::fs::create_dir_all(&dir)
-            .expect("Error: debug_append, failed dir creation")
-        ;
+            .expect(CREATE_DIR_ALL_ERR);
     }
 
     let path = format!("{dir}/{}.log", fname.as_ref());
@@ -79,12 +71,10 @@ pub fn debug_append(
         .append(true)
         .create(true)
         .open(path)
-        .expect("Error: debug_append, failed file open")
-    ;
+        .expect(OO_FOPEN_ERR);
 
     let _ = &mut file.write_all(buf.as_ref())
-        .expect("Error: debug_append, file write_all")
-    ;
+        .expect(WRITE_ALL_ERR);
 }
 
 #[cfg(debug_assertions)]
@@ -95,16 +85,14 @@ pub fn debug_err_append<'a, T, E: std::fmt::Display>(
 ) {
     if let Err(err) = error {
         let dir = get_xdg_state_dir(dir_name)
-            .expect("Error: debug_err_append, xdg_dir")
-        ;
+            .expect(GET_XDG_DIR_ERR);
 
         let path = format!("{dir}/{}", fname);
         if !fs::exists(&path)
-            .expect("Error: debug_err_append, file exists")
+            .expect(FS_EXISTS_ERR)
         {
             fs::create_dir_all(&dir)
-                .expect("Error: debug_err_append, create_dir_all")
-            ;
+                .expect(CREATE_DIR_ALL_ERR);
         }
 
         let mut file = fs::OpenOptions::new()
@@ -112,12 +100,10 @@ pub fn debug_err_append<'a, T, E: std::fmt::Display>(
             .append(true)
             .create(true)
             .open(path)
-            .expect("Error: debug_err_append, file open")
-        ;
+            .expect(OO_FOPEN_ERR);
 
         let err_msg = err.to_string();
         let _ = &mut file.write_all(
-            err_msg.as_ref()
-        ).expect("Error: debug_err_append, write_fmt");
+            err_msg.as_ref()).expect(WRITE_FMT_ERR);
     }
 }  
