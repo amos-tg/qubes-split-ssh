@@ -17,14 +17,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "qubes_split_ssh"
+name = "socket_stdinout"
 version = "0.1.0"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
-name = "socket_stdinout"
+name = "split_ssh_setup"
 version = "0.1.0"
 dependencies = [
  "anyhow",

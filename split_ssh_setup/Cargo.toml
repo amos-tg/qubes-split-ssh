@@ -1,5 +1,5 @@
 [package]
-name = "qubes_split_ssh"
+name = "split_ssh_setup"
 version = "0.1.0"
 edition = "2024"
 

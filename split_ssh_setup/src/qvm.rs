@@ -10,7 +10,7 @@ use std::{
 use crate::{
     DynRes,
     err,
-    pull_stdout,
+    msgs::pull_stdout,
 };
 
 use anyhow::anyhow;
@@ -28,20 +28,21 @@ use anyhow::anyhow;
 pub fn assure_qrexec(
     vm_name: &str,
 ) -> DynRes<()> {
+    const QRX_TIMEOUT_ERR: &str = 
+        "Error: Timed out waiting for the qrexec file in \
+        /var/run/qubes";
+
     start_vm(vm_name)?;
     let path = format!("/var/run/qubes/qrexec.{vm_name}");
 
-    let mut cnt = 0u8;
-    while !fs::exists(&path)? && cnt <= 20 {
+    let mut count = 0u8;
+    while !fs::exists(&path)? && count <= 20 {
         thread::sleep(Duration::from_secs(1));
-        cnt += 1;
+        count += 1;
     }
 
-    if cnt == 20 {
-        err!(format!(
-            "Error: Timed out waiting for the qrexec file in /var/run/qubes for VM {}",
-            vm_name,
-        ));
+    if count == 20 {
+        err!(QRX_TIMEOUT_ERR);
     }
 
     return Ok(());
@@ -54,6 +55,13 @@ pub fn get_user(
     stdin: &Stdin,
     vm_name: &str,
 ) -> DynRes<String> {
+    const STDERR_ERR: &str = 
+        "Error: failed to grab stderr on get_user call";
+    const GET_USER_ERR: &str = 
+        "Error: Failed to get user; qvm-run failure";
+    const STDOUT_ERR: &str = 
+        "Error: failed to grab stdout on get_user call"; 
+
     assure_qrexec(vm_name)?;
 
     let mut out = Command::new("qvm-run")
@@ -79,34 +87,25 @@ pub fn get_user(
             if status.success() {
                 break; 
             } else {
-                let child_stderr = &mut out.stderr.ok_or(anyhow!(format!(
-                    "Error: failed to grab stderr on get_user call. VM: {}",
-                    vm_name,
-                )))?;
+                let child_stderr = &mut out.stderr.ok_or(
+                    anyhow!(STDERR_ERR))?;
 
                 let mut stderr = String::new();
                 let _ = child_stderr.read_to_string(&mut stderr)?;
 
-                err!(format!(
-                    "Error: Failed to get user for VM: {}, qvm-run exited with code {}\n\nStderr: {}",
-                    vm_name, status, stderr,
-                ));
+                err!(GET_USER_ERR);
             }
         };
     }
 
-    let child_stdout = &mut out.stdout.ok_or(anyhow!(format!(
-        "Error: failed to grab stdout on get_user call. VM: {}",
-        vm_name,
-    )))?;
+    let child_stdout = &mut out.stdout.ok_or(anyhow!(STDOUT_ERR))?;
 
     let mut ls_stdout = String::new();
     let _ = child_stdout.read_to_string(&mut ls_stdout)?;
     
     let lines = ls_stdout
         .lines()
-        .collect::<Vec<&str>>()
-    ;
+        .collect::<Vec<&str>>();
     
     return Ok(if lines.len() > 1 {
         println!("{ls_stdout}");
@@ -125,6 +124,9 @@ pub fn get_user(
 }
 
 fn start_vm(vm_name: &str) -> DynRes<()> {
+    const START_VM_ERR: &str = 
+        "Error: failed to start vm";
+
     let out = Command::new("qvm-start")
         .arg(vm_name)
         .output()?
@@ -132,16 +134,16 @@ fn start_vm(vm_name: &str) -> DynRes<()> {
 
     let stderr = from_utf8(&out.stderr)?;
     if stderr.contains("rror") {
-        return Err(anyhow!( 
-            "Error: failed to start server template: {}",
-            vm_name,
-        ).into());
+        err!(START_VM_ERR);
     }
 
     return Ok(());
 }
 
 pub fn shutdown_vm(vm_name: &str) -> DynRes<()> {
+    const SHUTDOWN_ERR: &str = 
+        "Error: failed to shutdown vm";
+
     let out = Command::new("qvm-shutdown")
         .arg(vm_name)
         .output()?
@@ -149,10 +151,7 @@ pub fn shutdown_vm(vm_name: &str) -> DynRes<()> {
 
     let stderr = from_utf8(&out.stderr)?;
     if stderr.contains("rror") {
-        return Err(anyhow!( 
-            "Error: failed to start server template: {}",
-            vm_name,
-        ).into());
+        err!(SHUTDOWN_ERR);
     }
  
     return Ok(());

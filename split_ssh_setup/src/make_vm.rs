@@ -7,32 +7,45 @@ use std::{
 
 use anyhow::anyhow;
 use crate::{
+    err,
     DynRes,
     STATE_DIR,
-    SlsVmComplement,
-    parse_verify_state,
+    salt::SlsVmComplement,
+    salt::parse_verify_state,
+    msgs::make_vm::*,
 };
-use super::pull_stdout;
+use crate::msgs::pull_stdout;
 
 pub fn gen_vms(
     stdin: &Stdin,
     mut stdout: &mut Stdout,
 ) -> DynRes<VmNames> {
-    const SKIP_MSG: &str = "[Skipping VM Configuration & Creation for Existing Client Template]";
+    const SKIP_MSG: &str = 
+        "[Skipping VM Configuration & Creation for Existing Client Template]";
+    const QVM_C_T_ERR: &str =
+        "Error: failed qvm-clone for client-template";
+    const QVM_C_DVM_T_ERR: &str = 
+        "Error: failed dvm-client-template creation";
+    const QVM_C_DVM_ERR: &str = 
+        "Error: failed to make client_dvm";
+    const QVM_S_T_ERR: &str = 
+        "Error: failed server-template creation";
+    const QVM_S_A_ERR: &str = 
+        "Error: failed server-appvm creation";
+
     println!("[VM Creation]:\n");
 
-    let client_template_name = Ident::exists(pull_stdout(
-        &mut stdout,
-        &stdin,  
-        "[Input the SSH Client Template Name]: "
-    )?)?;
+    let client_template_name = Ident::exists(
+        pull_stdout(
+            &mut stdout,
+            &stdin,  
+            C_T_NAME_PROMPT)?)?;
 
     if let Ident::New(name) = &client_template_name { 
         let source_template = pull_stdout(
             &mut stdout,
             &stdin,
-            format!("\n[Input Source Template for {}]: ", &name),
-        )?;
+            format!("\n[Input Source Template for {}]: ", &name))?;
 
         let client_template_clone_out = Command::new("qvm-clone")
             .args([
@@ -40,15 +53,11 @@ pub fn gen_vms(
                 "TemplateVM",
                 &source_template,
                 &name,
-            ])
-            .output()?
-        ;
+            ]) .output()?;
 
         let stderr = from_utf8(&client_template_clone_out.stderr)?;
         if stderr.contains("qvm-clone: error:") {
-            return Err(anyhow!(
-                "Error: failed qvm-clone for client-template {}", stderr
-            ).into());
+            err!(QVM_C_T_ERR);
         }
 
         /* for some reason qvm-prefs doesn't allow setting more than 
@@ -59,11 +68,11 @@ pub fn gen_vms(
         println!("\n{SKIP_MSG}");
     }
 
-    let dvm_client_template_name = Ident::exists(pull_stdout(
-        &mut stdout,
-        &stdin,
-        "\n[Input Name for SSH Client Disposable Template]: "
-    )?)?;
+    let dvm_client_template_name = Ident::exists(
+        pull_stdout(
+            &mut stdout,
+            &stdin,
+            DVM_C_T_NAME_PROMPT)?)?;
 
     if let Ident::New(name) = &dvm_client_template_name {
         let dvm_client_template_create_out = Command::new("qvm-create")
@@ -76,25 +85,22 @@ pub fn gen_vms(
                 "-t", 
                 client_template_name.as_ref(),
                 &name,
-            ])
-            .output()?                         
-        ;
+            ]).output()?;
 
-        let stderr = from_utf8(&dvm_client_template_create_out.stderr)?;
+        let stderr = from_utf8(
+            &dvm_client_template_create_out.stderr)?;
+
         if !stderr.is_empty() {
-            return Err(anyhow!(
-                "Error: failed dvm-client-template creation: {}", stderr
-            ).into());   
+            err!(QVM_C_DVM_T_ERR);
         }
     } else {
-        println!("\n{SKIP_MSG}")
+        println!("\n{SKIP_MSG}");
     } 
 
     let client_dvm_name = Ident::exists(pull_stdout(
         &mut stdout,
         &stdin,
-        "\n[Input Name for Disposable SSH Client VM]: ",
-    )?)?;
+        DVM_C_NAME_PROMPT)?)?;
 
     if let Ident::New(name) = &client_dvm_name {
         let dvm_client_create_out = Command::new("qvm-create")
@@ -104,17 +110,11 @@ pub fn gen_vms(
                 "-t", 
                 &dvm_client_template_name.as_ref(),
                 "--prop=label=red",
-
-                &name,
-            ])
-            .output()?
-        ; 
+                &name]).output()?; 
 
         let stderr = from_utf8(&dvm_client_create_out.stderr)?;
         if !stderr.is_empty() {
-            return Err(anyhow!(
-                "Error: failed to make client_dvm: {}", stderr
-            ).into());   
+            err!(QVM_C_DVM_ERR);
         }
     } else {
         println!("\n{SKIP_MSG}");
@@ -122,18 +122,18 @@ pub fn gen_vms(
 
     drop(dvm_client_template_name);
 
-    let server_template_name = Ident::exists(pull_stdout(
-        &mut stdout,
-        &stdin,
-        "\n[Input Server Template VM Name]: ",
-    )?)?;
-
-    if let Ident::New(name) = &server_template_name {
-        let template = Ident::exists(pull_stdout(
+    let server_template_name = Ident::exists(
+        pull_stdout(
             &mut stdout,
             &stdin,
-            "\n[Input the TemplateVM for the SSH Server Template]: ",
-        )?)?;
+            S_T_NAME_PROMPT)?)?;
+
+    if let Ident::New(name) = &server_template_name {
+        let template = Ident::exists(
+            pull_stdout(
+                &mut stdout,
+                &stdin,
+                S_T_SOURCE_PROMPT)?)?;
 
         let server_template_clone_out = Command::new("qvm-clone")
             .args([
@@ -141,15 +141,11 @@ pub fn gen_vms(
                 "TemplateVM",
                 template.as_ref(),
                 &name,
-            ])
-            .output()?
-        ; 
+            ]).output()?; 
 
         let stderr = from_utf8(&server_template_clone_out.stderr)?;
         if stderr.contains("qvm-clone: error:") {
-            return Err(anyhow!(
-                "Error: failed server-template creation: {}", stderr
-            ).into());
+            err!(QVM_S_T_ERR);
         }
 
         qvm_prefs(&[&name, "label",  "black"])?;
@@ -158,11 +154,11 @@ pub fn gen_vms(
         println!("\n{SKIP_MSG}");
     }
 
-    let server_appvm_name = Ident::exists(pull_stdout(
-        &mut stdout,
-        &stdin,
-        "\n[Input Server AppVM Name]: ",
-    )?)?;
+    let server_appvm_name = Ident::exists(
+        pull_stdout(
+            &mut stdout,
+            &stdin,
+            S_A_NAME_PROMPT)?)?;
 
     if let Ident::New(name) = &server_appvm_name {
         let server_appvm_create_out = Command::new("qvm-create")
@@ -174,15 +170,11 @@ pub fn gen_vms(
                 "-t", 
                 server_template_name.as_ref(), 
                 &name,
-            ])
-            .output()?
-        ;
+            ]).output()?;
 
         let stderr = from_utf8(&server_appvm_create_out.stderr)?;
         if !stderr.is_empty() {
-            return Err(anyhow!(
-                "Error: failed server-appvm creation: {}", stderr
-            ).into());   
+            err!(QVM_S_A_ERR);
         }
     } else {
         println!("\n{SKIP_MSG}");
@@ -199,6 +191,9 @@ pub fn gen_vms(
 fn qvm_prefs(
     args: &[&str],
 ) -> DynRes<()> {
+    const QVM_PREFS_ERR: &str = 
+        "Error: failed qvm-prefs";
+
     let prefs_out = Command::new("qvm-prefs")
         .args(args)
         .output()?
@@ -206,9 +201,7 @@ fn qvm_prefs(
 
     let stderr = from_utf8(&prefs_out.stderr)?;
     if !stderr.is_empty() {
-        return Err(anyhow!(
-            "Error: failed qvm-prefs: {}", stderr
-        ).into());
+        err!(QVM_PREFS_ERR);
     }
 
     return Ok(());
@@ -226,18 +219,14 @@ impl Ident {
             .args([
                 "--raw-list",
                 &vm,
-            ])
-            .output()?
-        ;
+            ]).output()?;
 
         let (stdout, stderr) = (
             from_utf8(&out.stdout)?,
-            from_utf8(&out.stderr)?,
-        );
+            from_utf8(&out.stderr)?);
 
-        dbg!(&vm, stdout, stderr);
-
-        if stdout.contains(&vm) && !stderr.contains("no such domain:") {
+        if stdout.contains(&vm) &&
+            !stderr.contains("no such domain:") {
             return Ok(Ident::Existing(vm));
         } else {
             return Ok(Ident::New(vm));
@@ -290,8 +279,7 @@ client_deps:
     {% elif os == "Debian" %}
       - openssh-client
       - socat
-    {% endif %}"#
-    ;
+    {% endif %}"#;
 
     const SERVER_SLS: &str = 
 r#"{% set os = salt['grains.get']('os') %}
@@ -308,8 +296,7 @@ server_deps:
       - socat
       - ssh-askpass
       - libnotify-bin
-    {% endif %}"#
-    ;
+    {% endif %}"#;
 
     let state_dir;
     if let Some(dir) = custom_dir {

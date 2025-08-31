@@ -3,15 +3,14 @@ use std::fs;
 use crate::{
     DynRes,
     SALT_FILES_DIR,
-    parse_verify_file,
-    parse_verify_state,
+    salt::{parse_verify_file, parse_verify_state},
     STATE_DIR,
-    SlsVmComplement,
+    TMP_DIR,
+    salt::SlsVmComplement,
+    make_vm::VmNames,
 };
 
-use super::make_vm::VmNames;
-
-// generates new and overwrites all existing split-ssh related files for dom0.
+/// generates new and overwrites all existing split-ssh related files for dom0.
 pub fn maint_files(
     vm_names: &VmNames,
     files_dir: &Option<String>,
@@ -23,8 +22,7 @@ pub fn maint_files(
         "qubes.SshAgent * {} {} ask default_target={}",
         vm_names.dvm_client,
         vm_names.server_appvm,
-        vm_names.server_appvm,
-    );
+        vm_names.server_appvm);
 
     let mut path;
     if let Some(dir) = files_dir {
@@ -37,8 +35,7 @@ pub fn maint_files(
 
     path = parse_verify_file(
         path,
-        file_roots,
-    )?;
+        file_roots)?;
 
     content = format!(
 r#"dom0-split-ssh-policy:
@@ -47,10 +44,10 @@ r#"dom0-split-ssh-policy:
     - source: {path}
     - user: root
     - group: root
-    - mode: 644"#
-    );
+    - mode: 644"#);
 
-    let state_path = format!("{STATE_DIR}/split-ssh/ssh-policy.sls");
+    let state_path = format!(
+        "{STATE_DIR}/split-ssh/ssh-policy.sls");
     fs::write(&state_path, content)?;
 
     return Ok(SlsVmComplement { 
@@ -58,8 +55,37 @@ r#"dom0-split-ssh-policy:
         states: vec![
             parse_verify_state(
                 state_path,
-                file_roots,
-            )?
+                file_roots)?
         ],
     });
 } 
+
+/// makes sure that TMP_DIR, file_dir, and state_dir exist in the filesystem.
+pub fn init_dirs(
+    file_dir: &Option<String>,
+    state_dir: &Option<String>,
+) -> DynRes<()> {
+    const DIR_NAME: &str = "split-ssh";
+
+    fs::create_dir_all(TMP_DIR)?;
+    let mut dir;
+    if let Some(d) = file_dir {
+        dir = d.to_string();
+    } else {
+        dir = SALT_FILES_DIR.to_string();
+    }
+
+    dir = format!("{dir}/{DIR_NAME}");
+    fs::create_dir_all(&dir)?;
+
+    if let Some(d) = state_dir {
+        dir = d.to_string();
+    } else {
+        dir = STATE_DIR.to_string();
+    }
+
+    dir = format!("{dir}/{DIR_NAME}");
+    fs::create_dir_all(&dir)?;
+
+    return Ok(());
+}
