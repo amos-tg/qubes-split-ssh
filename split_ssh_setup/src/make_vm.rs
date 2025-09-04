@@ -1,10 +1,9 @@
 use std::{
     fs,
-    io::{Stdin, Stdout},
+    io::{Stdin, Stdout, self},
     process::Command,
     str::from_utf8,
 };
-
 use anyhow::anyhow;
 use crate::{
     err,
@@ -13,6 +12,7 @@ use crate::{
     salt::SlsVmComplement,
     salt::parse_verify_state,
     msgs::make_vm::*,
+    qvm::*,
 };
 use crate::msgs::pull_stdout;
 
@@ -259,7 +259,6 @@ pub struct VmNames {
     pub server_appvm: String,
 }
 
-
 /// returns the absolute path of the
 /// generated files so they can
 /// be added to a top file.
@@ -325,4 +324,71 @@ server_deps:
             ],
         },
     ]);
+}
+
+pub struct Binaries {
+    pub client_handler: Vec<u8>,
+    pub vault_handler: Vec<u8>,
+}
+
+impl Binaries {
+    pub fn build(
+        stdout: &mut Stdout, 
+        stdin: &Stdin,
+    ) -> DynRes<Self> {
+        const BUILD_ERR: &str = 
+            "Error: failed to build the project";
+    
+        let build_vm = pull_stdout(
+            stdout,
+            stdin,
+            BUILD_VM_QUERY)?;
+    
+        let src_path = pull_stdout(
+            stdout,
+            stdin, 
+            QSS_SRC_QUERY)?;
+    
+        let user = get_user(
+            stdout,
+            stdin,
+            &build_vm)?;
+    
+        assure_qrexec(&build_vm)?;
+        let build_out = Command::new("qvm-run")
+            .args([
+                "-u", &user, &build_vm,
+                "--", "cargo", "build",
+                "--release", "--manifest-path", &format!(
+                    "{}/Cargo.toml", &src_path),
+            ])
+            .output()?;
+    
+        if str::from_utf8(&build_out.stderr)?.contains("error") {
+            return Err(anyhow!(BUILD_ERR).into()); 
+        }
+    
+        let get_bin = |pkg_name: &str| -> io::Result<_> { 
+            let cat_out = Command::new("qvm-run")
+                .args([
+                    "-u", &user, "--pass-io", 
+                    &build_vm, "--", "cat",
+                    &format!(
+                        "{}/target/release/{}", 
+                        &src_path, 
+                        pkg_name), 
+                ])
+                .output()?;
+    
+            return Ok(cat_out.stdout);
+        };
+    
+        let client_handler = get_bin(CLIENT_PKG_NAME)?;
+        let vault_handler = get_bin(VAULT_PKG_NAME)?;
+    
+        return Ok(Self {
+            client_handler,
+            vault_handler,
+        });
+    }
 }

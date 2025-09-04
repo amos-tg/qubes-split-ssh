@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::{Stdin, Stdout},
+    process::Command,
 };
 use crate::{
     DynRes,
@@ -20,7 +21,17 @@ use crate::{
     STATE_DIR,
 };
 
-pub fn maint_files(
+pub fn maint_files_rust(
+    vm_names: &VmNames, 
+    stdout: &mut Stdout,
+    stdin: &Stdin,
+) -> DynRes<SlsVmComplement> {
+    let tuser = get_user(vm_names.client_template)?; 
+
+    todo!();
+}
+
+pub fn maint_files_socat(
     mut stdout: &mut Stdout,
     stdin: &Stdin,
     vm_names: &VmNames, 

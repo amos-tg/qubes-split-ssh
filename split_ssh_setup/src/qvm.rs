@@ -78,8 +78,7 @@ pub fn get_user(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?
-    ;
+        .spawn()?;
 
     loop {
         thread::sleep(Duration::from_secs(1));

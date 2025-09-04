@@ -3,7 +3,6 @@ use crate::{
     ERR_LOG_DIR_NAME,
 };
 use socket_stdinout::debug::debug_err_append;
-
 use std::{
     ops::{
         Deref,
@@ -19,7 +18,6 @@ use std::{
         Command,
     },
 };
-
 use anyhow::anyhow;
 
 const DEBUG_FNAME: &str = "Qrexec";
@@ -29,14 +27,11 @@ pub struct DropChild(Child);
 
 impl Drop for DropChild {
     fn drop(&mut self) {
-        let id = self.0.id(); 
-        self.0.kill().expect(
-            &format!(
-                "Error failed to kill qrexec-client-vm during cleanup drop \
-                execution: PID for manual kill = {}",
-                id,
-            )
-        );
+        const QRX_KILL_ERR: &str = 
+            "Error failed to kill qrexec-client-vm during cleanup drop"; 
+
+        self.0.kill()
+            .expect(QRX_KILL_ERR);
     }
 }
 
@@ -53,6 +48,7 @@ impl DerefMut for DropChild {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct QRExecProc {
     _child: DropChild,
@@ -61,19 +57,15 @@ pub struct QRExecProc {
     pub stderr: ChildStderr,
 }
 
-// I am aware that qrexec-client-vm takes a local program argument
-// unfortunately rust does not impl io::Write for io::Stdin, but it 
-// does for process::ChildStdin. 
-
 impl QRExecProc {
     const VAULT_VM_NAME_ENV: &str = "SSH_VAULT_VM";
-    const RPC_SERVICE_NAME: &str = "qubes.SplitSSHAgent";
-    const STDIN_ERR: &str = "Error: failed to produce a stdin \
-        for qrexec child proc.";
-    const STDOUT_ERR: &str = "Error: failed to produce a stdout \
-        for qrexec child proc.";
-    const STDERR_ERR: &str = "Error: failed to produce a stderr \
-        for qrexec child proc.";
+    const RPC_SERVICE_NAME: &str = "qubes.SshAgent";
+    const STDIN_ERR: &str = 
+        "Error: failed to produce a stdin for qrexec child proc.";
+    const STDOUT_ERR: &str = 
+        "Error: failed to produce a stdout for qrexec child proc.";
+    const STDERR_ERR: &str = 
+        "Error: failed to produce a stderr for qrexec child proc.";
 
     pub fn new() -> DynError<Self> { 
         let remote_vm = {
@@ -81,8 +73,7 @@ impl QRExecProc {
             debug_err_append(
                 &var,
                 DEBUG_FNAME,
-                ERR_LOG_DIR_NAME,
-            );
+                ERR_LOG_DIR_NAME);
             var?
         };
 
@@ -94,8 +85,7 @@ impl QRExecProc {
             .stdin(Stdio::piped()) 
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?
-        );
+            .spawn()?);
 
         let stdin = child.stdin.take().ok_or(
             anyhow!(Self::STDIN_ERR))?;

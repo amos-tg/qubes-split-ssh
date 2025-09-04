@@ -16,7 +16,8 @@ pub fn maint_files(
     files_dir: &Option<String>,
     file_roots: &Vec<String>,
 ) -> DynRes<SlsVmComplement> {
-    const SSH_POLICY_PATH: &str = "/etc/qubes/policy.d/10-ssh.policy";
+    const SSH_POLICY_PATH: &str = 
+        "/etc/qubes/policy.d/10-split-ssh.policy";
 
     let mut content = format!(
         "qubes.SshAgent * {} {} ask default_target={}",
@@ -26,10 +27,10 @@ pub fn maint_files(
 
     let mut path;
     if let Some(dir) = files_dir {
-        path = format!("{dir}/split-ssh/10-ssh.policy");
+        path = format!("{dir}/split-ssh/10-split-ssh.policy");
         fs::write(&path, content)?;
     } else {
-        path = format!("{SALT_FILES_DIR}/split-ssh/10-ssh.policy");
+        path = format!("{SALT_FILES_DIR}/split-ssh/10-split-ssh.policy");
         fs::write(&path, content)?;
     }
 
@@ -47,7 +48,7 @@ r#"dom0-split-ssh-policy:
     - mode: 644"#);
 
     let state_path = format!(
-        "{STATE_DIR}/split-ssh/ssh-policy.sls");
+        "{STATE_DIR}/split-ssh/split-ssh-policy.sls");
     fs::write(&state_path, content)?;
 
     return Ok(SlsVmComplement { 
