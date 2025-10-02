@@ -1,18 +1,18 @@
 use std::{
-    fs,
-    io::{Stdin, Stdout, Read},
+    io::{Stdin, Stdout, Read, self},
     process::{Command, Stdio},
     str::from_utf8,
     time::Duration,
+    path::Path,
     thread,
+    fs,
 };
-
 use crate::{
     DynRes,
     err,
     msgs::pull_stdout,
+    make_vm::VmNames,
 };
-
 use anyhow::anyhow;
 
 // qvm-run does not always initiate
@@ -114,8 +114,7 @@ pub fn get_user(
             &format!(
                 "[Which user should be configured for {}?]:",
                 vm_name,
-            ),
-        )?
+            ))?
     } else {
         ls_stdout.trim().to_string()
     });
@@ -128,8 +127,7 @@ fn start_vm(vm_name: &str) -> DynRes<()> {
 
     let out = Command::new("qvm-start")
         .arg(vm_name)
-        .output()?
-    ;
+        .output()?;
 
     let stderr = from_utf8(&out.stderr)?;
     if stderr.contains("rror") {
@@ -145,13 +143,36 @@ pub fn shutdown_vm(vm_name: &str) -> DynRes<()> {
 
     let out = Command::new("qvm-shutdown")
         .arg(vm_name)
-        .output()?
-    ;
+        .output()?;
 
     let stderr = from_utf8(&out.stderr)?;
     if stderr.contains("rror") {
         err!(SHUTDOWN_ERR);
     }
  
+    return Ok(());
+}
+
+/// WARNING using this function with an existing file at the 
+/// fout_path parameters value will overwrite the file at
+/// fout_path.
+pub fn qvm_copy(
+    fpaths: &[&str],
+    to_vm: &str,
+) -> DynRes<()> {
+    const QVM_COPY_ERR: &str = 
+        "Error: qvm-copy-to-vm in qvm_copy failed";
+    
+    assure_qrexec(to_vm)?;
+
+    let copy_out = Command::new("qvm-copy-to-vm")
+        .arg(to_vm)
+        .args(fpaths)
+        .output()?;
+
+    if !from_utf8(&copy_out.stderr)?.is_empty() {
+        return Err(anyhow!(QVM_COPY_ERR).into()); 
+    }
+
     return Ok(());
 }

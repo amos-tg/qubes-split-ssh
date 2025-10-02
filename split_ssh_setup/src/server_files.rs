@@ -28,12 +28,12 @@ pub fn maint_files(
     states_dir: &Option<String>,
     file_roots: &Vec<String>,
 ) -> DynRes<[SlsVmComplement; 2]> {
-    assure_qrexec(&vm_names.server_appvm)?;
+    assure_qrexec(&vm_names.server_appvm.name)?;
     let user = get_user(
         &mut stdout,
         &stdin,
-        &vm_names.server_appvm)?;
-    shutdown_vm(&vm_names.server_appvm)?;
+        &vm_names.server_appvm.name)?;
+    shutdown_vm(&vm_names.server_appvm.name)?;
 
     let saf = ssh_add_file(
         &vm_names,
@@ -111,7 +111,7 @@ r#"key-adder-vault-desktop:
         &key_adder_desktop_sls_path, key_adder_desktop_sls_cont)?;
 
     return Ok(SlsVmComplement {
-        target_vm: vm_names.server_appvm.to_string(),
+        target_vm: vm_names.server_appvm.name.clone(),
         states: vec![parse_verify_state(
             key_adder_desktop_sls_path,
             file_roots)?],
@@ -172,7 +172,7 @@ r#"vault-qubes-SshAgent-script:
     }
 
     return Ok(SlsVmComplement {
-        target_vm: vm_names.server_template.to_string(),
+        target_vm: vm_names.server_template.name.to_string(),
         states: vec![parse_verify_state(
             sls_path,
             file_roots)?],

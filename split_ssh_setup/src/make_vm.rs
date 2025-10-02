@@ -13,6 +13,7 @@ use crate::{
     salt::parse_verify_state,
     msgs::make_vm::*,
     qvm::*,
+    TMP_DIR,
 };
 use crate::msgs::pull_stdout;
 
@@ -180,11 +181,31 @@ pub fn gen_vms(
         println!("\n{SKIP_MSG}");
     }
 
+    let client_template_name: String = client_template_name.into();
+    let client_dvm_name: String = client_dvm_name.into();
+    let server_template_name: String = server_template_name.into();
+    let server_appvm_name: String = server_appvm_name.into();
     return Ok(VmNames {
-        client_template: client_template_name.into(),
-        dvm_client: client_dvm_name.into(),
-        server_template: server_template_name.into(),
-        server_appvm: server_appvm_name.into(),
+        client_template: VmInfo {
+            user: get_user(
+                stdout, stdin, &client_template_name)?,
+            name: client_template_name,
+        },
+        dvm_client: VmInfo {
+            user: get_user(
+                stdout, stdin, &client_dvm_name)?,
+            name: client_dvm_name,
+        },
+        server_template: VmInfo {
+            user: get_user(
+                stdout, stdin, &server_template_name)?,
+            name: server_template_name,
+        },
+        server_appvm: VmInfo {
+            user: get_user(
+                stdout, stdin, &server_appvm_name)?,
+            name: server_appvm_name,
+        },
     });
 }
 
@@ -253,10 +274,15 @@ impl std::convert::AsRef<str> for Ident {
 }
 
 pub struct VmNames {
-    pub client_template: String,
-    pub dvm_client: String,
-    pub server_template: String,
-    pub server_appvm: String,
+    pub client_template: VmInfo,
+    pub dvm_client: VmInfo,
+    pub server_template: VmInfo,
+    pub server_appvm: VmInfo,
+}
+
+pub struct VmInfo {
+    pub name: String,
+    pub user: String,
 }
 
 /// returns the absolute path of the
@@ -312,13 +338,13 @@ server_deps:
 
     return Ok([
         SlsVmComplement {
-            target_vm: vm_names.client_template.to_string(),
+            target_vm: vm_names.client_template.name.to_string(),
             states: vec![
                 parse_verify_state(client_path, file_roots)?
             ],
         },
         SlsVmComplement {
-            target_vm: vm_names.server_template.to_string(),
+            target_vm: vm_names.server_template.name.to_string(),
             states: vec![
                 parse_verify_state(vault_path, file_roots)?
             ],
@@ -326,69 +352,75 @@ server_deps:
     ]);
 }
 
-pub struct Binaries {
-    pub client_handler: Vec<u8>,
-    pub vault_handler: Vec<u8>,
+
+pub fn build_bins(
+    stdout: &mut Stdout, 
+    stdin: &Stdin,
+    vm_names: &VmNames,
+) -> DynRes<()> {
+    const BUILD_ERR: &str = 
+        "Error: failed to build the project";
+
+    let build_vm = pull_stdout(
+        stdout,
+        stdin,
+        BUILD_VM_QUERY)?;
+
+    let src_path = pull_stdout(
+        stdout,
+        stdin, 
+        QSS_SRC_QUERY)?;
+
+    let user = get_user(
+        stdout,
+        stdin,
+        &build_vm)?;
+
+    assure_qrexec(&build_vm)?;
+    let build_out = Command::new("qvm-run")
+        .args([
+            "-u", &user, &build_vm,
+            "--", "cargo", "build",
+            "--release", "--manifest-path", &format!(
+                "{}/Cargo.toml", &src_path),
+        ])
+        .output()?;
+
+    if str::from_utf8(&build_out.stderr)?.contains("error") {
+        return Err(anyhow!(BUILD_ERR).into()); 
+    }
+
+    fs::create_dir_all(TMP_DIR)?;
+
+    let get_bin = |pkg_name: &str| -> io::Result<_> { 
+        let fpath = format!("/tmp/{TMP_DIR}/{pkg_name}");
+        let cat_out = Command::new("qvm-run")
+            .args([
+                "-u", &user, "--pass-io", 
+                &build_vm, "--", "cat",
+                &format!(
+                    "{}/target/release/{}", 
+                    &src_path, pkg_name), 
+            ]).output()?;
+
+        fs::write(&fpath, &cat_out.stdout)?;
+
+        return Ok((cat_out, fpath));
+    };
+
+    let (chandler_out, cfpath) = get_bin(CLIENT_PKG_NAME)?;
+    if !chandler_out.status.success() {
+        return Err(anyhow!(BUILD_ERR).into());
+    }
+
+    let (vhandler_out, vfpath) = get_bin(VAULT_PKG_NAME)?;
+    if !vhandler_out.status.success() {
+        return Err(anyhow!(BUILD_ERR).into());
+    }
+
+    qvm_copy(&[cfpath.as_str()], &vm_names.client_template.name)?;
+    qvm_copy(&[vfpath.as_str()], &vm_names.server_template.name)?; 
+
+    return Ok(());
 }
 
-impl Binaries {
-    pub fn build(
-        stdout: &mut Stdout, 
-        stdin: &Stdin,
-    ) -> DynRes<Self> {
-        const BUILD_ERR: &str = 
-            "Error: failed to build the project";
-    
-        let build_vm = pull_stdout(
-            stdout,
-            stdin,
-            BUILD_VM_QUERY)?;
-    
-        let src_path = pull_stdout(
-            stdout,
-            stdin, 
-            QSS_SRC_QUERY)?;
-    
-        let user = get_user(
-            stdout,
-            stdin,
-            &build_vm)?;
-    
-        assure_qrexec(&build_vm)?;
-        let build_out = Command::new("qvm-run")
-            .args([
-                "-u", &user, &build_vm,
-                "--", "cargo", "build",
-                "--release", "--manifest-path", &format!(
-                    "{}/Cargo.toml", &src_path),
-            ])
-            .output()?;
-    
-        if str::from_utf8(&build_out.stderr)?.contains("error") {
-            return Err(anyhow!(BUILD_ERR).into()); 
-        }
-    
-        let get_bin = |pkg_name: &str| -> io::Result<_> { 
-            let cat_out = Command::new("qvm-run")
-                .args([
-                    "-u", &user, "--pass-io", 
-                    &build_vm, "--", "cat",
-                    &format!(
-                        "{}/target/release/{}", 
-                        &src_path, 
-                        pkg_name), 
-                ])
-                .output()?;
-    
-            return Ok(cat_out.stdout);
-        };
-    
-        let client_handler = get_bin(CLIENT_PKG_NAME)?;
-        let vault_handler = get_bin(VAULT_PKG_NAME)?;
-    
-        return Ok(Self {
-            client_handler,
-            vault_handler,
-        });
-    }
-}

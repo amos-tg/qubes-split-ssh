@@ -1,11 +1,10 @@
 use std::{
     fs,
     io::{Stdin, Stdout},
-    process::Command,
 };
 use crate::{
     DynRes,
-    make_vm::VmNames,
+    make_vm::{VmNames, Binaries},
     SALT_FILES_DIR,
     salt::{
         parse_verify_file,
@@ -22,11 +21,17 @@ use crate::{
 };
 
 pub fn maint_files_rust(
+    bins: &Binaries,
     vm_names: &VmNames, 
     stdout: &mut Stdout,
     stdin: &Stdin,
 ) -> DynRes<SlsVmComplement> {
-    let tuser = get_user(vm_names.client_template)?; 
+    let ct_user = get_user(
+        stdout,
+        stdin,
+        &vm_names.client_template.name)?; 
+
+
 
     todo!();
 }
@@ -40,16 +45,16 @@ pub fn maint_files_socat(
     file_roots: &Vec<String>,
 ) -> DynRes<SlsVmComplement> {
     let mut states = SlsVmComplement {
-        target_vm: String::from(&vm_names.client_template),
+        target_vm: String::from(&vm_names.client_template.name),
         states: vec![],
     };
 
-    assure_qrexec(&vm_names.dvm_client)?;
+    assure_qrexec(&vm_names.dvm_client.name)?;
     let user = get_user(
         &mut stdout,
         &stdin,
-        &vm_names.dvm_client)?;
-    shutdown_vm(&vm_names.dvm_client)?;
+        &vm_names.dvm_client.name)?;
+    shutdown_vm(&vm_names.dvm_client.name)?;
 
     states.states.push(
         agent_service_file(
@@ -61,7 +66,7 @@ pub fn maint_files_socat(
 
     states.states.push(
         global_bashrc_file(
-            &vm_names.server_appvm,
+            &vm_names.server_appvm.name,
             files_dir,
             states_dir,
             file_roots)?);
@@ -96,7 +101,7 @@ SSH_VAULT_VM="{}"
 export SSH_SOCK="$TMP_DIR/SSH_AGENT_$SSH_VAULT_VM"
 
 sudo -u user /bin/sh -c "umask 177 && exec socat 'UNIX-LISTEN:$SSH_SOCK,fork' 'EXEC:qrexec-client-vm $SSH_VAULT_VM qubes.SshAgent'" &"#,
-        vm_names.server_appvm);
+        vm_names.server_appvm.name);
 
     let desktop_cont = format!(
 r#"[Desktop Entry]

@@ -197,7 +197,8 @@ fn rust_p_main(
 ) -> DynRes<()> {
     let bins = Binaries::build(
         stdout,
-        stdin)?;
+        stdin,
+        vm_names)?;
 
     states.push(
         dom0_files::maint_files(
@@ -206,10 +207,11 @@ fn rust_p_main(
             file_roots)?);
     
     states.push(
-        client_files::maint_files_rust()?);
+        client_files::maint_files_rust(
+            &bins, vm_names, stdout, stdin)?);
 
     states.push(
-        server_files::main_files_rust()?);
+        server_files::maint_files_rust()?);
 
     return Ok(());
 }

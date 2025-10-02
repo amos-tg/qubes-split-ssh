@@ -21,9 +21,9 @@ pub fn maint_files(
 
     let mut content = format!(
         "qubes.SshAgent * {} {} ask default_target={}",
-        vm_names.dvm_client,
-        vm_names.server_appvm,
-        vm_names.server_appvm);
+        vm_names.dvm_client.name,
+        vm_names.server_appvm.name,
+        vm_names.server_appvm.name);
 
     let mut path;
     if let Some(dir) = files_dir {
@@ -61,14 +61,13 @@ r#"dom0-split-ssh-policy:
     });
 } 
 
-/// makes sure that TMP_DIR, file_dir, and state_dir exist in the filesystem.
+/// makes sure that file_dir, and state_dir exist in the filesystem.
 pub fn init_dirs(
     file_dir: &Option<String>,
     state_dir: &Option<String>,
 ) -> DynRes<()> {
     const DIR_NAME: &str = "split-ssh";
 
-    fs::create_dir_all(TMP_DIR)?;
     let mut dir;
     if let Some(d) = file_dir {
         dir = d.to_string();
