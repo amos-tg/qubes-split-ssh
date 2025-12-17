@@ -1,10 +1,9 @@
-// why isn't it erring if SSH_AUTH_SOCK Is unset?
 use std::io;
 
 use socket_stdinout::{
     self as sock,
     ERR_LOG_DIR_NAME,
-    debug::debug_err_append,
+    debug::append,
     types::DynError,
 };
 
@@ -14,10 +13,11 @@ fn main() -> DynError<()> {
     let (stdin, stdout) = (
         io::stdin(),  
         io::stdout());
+
     let listener = {
         let sock_res = sock::SockStream::new();
-        debug_err_append(
-            &sock_res,
+        append(
+            &sock_res.to_string(),
             DEBUG_FNAME,
             ERR_LOG_DIR_NAME);
         sock_res?
@@ -26,10 +26,12 @@ fn main() -> DynError<()> {
     let conn_res = listener.handle_connections(
         stdout, 
         stdin);
-    debug_err_append(
-        &conn_res,
+
+    append(
+        &conn_res.to_string(),
         DEBUG_FNAME,
         ERR_LOG_DIR_NAME);
+
     conn_res?;
 
     return Ok(());

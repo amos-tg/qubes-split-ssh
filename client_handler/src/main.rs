@@ -13,8 +13,8 @@ const DEBUG_FNAME: &str = "Main";
 fn main() -> DynError<()> {
     let qrexec = {
         let qrexec_res = QRExecProc::new();
-        debug_err_append(
-            &qrexec_res,
+        append(
+            &qrexec_res.to_string(),
             DEBUG_FNAME,
             ERR_LOG_DIR_NAME);
         qrexec_res?
@@ -22,8 +22,8 @@ fn main() -> DynError<()> {
 
     let stream = {
         let stream_res = sock::SockListener::new();
-        debug_err_append(
-            &stream_res,
+        append(
+            &stream_res.to_string(),
             DEBUG_FNAME,
             ERR_LOG_DIR_NAME);
         stream_res?
@@ -32,8 +32,9 @@ fn main() -> DynError<()> {
     let conn_res = stream.handle_connections(
         qrexec.stdin,
         qrexec.stdout);
-    debug_err_append(
-        &conn_res,
+
+    append(
+        &conn_res.to_string(),
         DEBUG_FNAME,
         ERR_LOG_DIR_NAME);
     conn_res?;
