@@ -22,9 +22,8 @@ use std::{
         },
     },
     sync::{
-        atomic::{AtomicBool, Ordering::*},
         Arc,
-        Mutex,
+        atomic::{AtomicBool, Ordering::*},
     },
     os::unix::{
         net::{UnixListener, UnixStream},
@@ -39,18 +38,6 @@ const KIB64: usize = 65536;
 
 type Thread = JoinHandle<()>;
 
-fn kill_thread(
-    kill: &AtomicBool, 
-    dbg_fname: &str,
-    msg: &str,
-) {
-    kill.store(true, Relaxed);
-    append(
-        msg,
-        dbg_fname,
-        ERR_LOG_DIR_NAME);
-    panic!("{}", msg);
-}
 
 pub struct SockStdInOutCon {
     kill: Arc<AtomicBool>,
@@ -120,13 +107,32 @@ impl Drop for SockStdInOutCon {
     }
 }
 
-#[derive(Clone, Debug)]
-enum Model {
-    Client,
-    Vault,
+const GRACEFUL_SHUTDOWN: &str = "Error: got Ok(0) read on ";
+const MSG_KILL_TRIG: &str = "Error: kill flag triggered";
+
+fn kill_thread(
+    kill: &AtomicBool, 
+    dbg_fname: &str,
+    msg: &str,
+) {
+    kill.store(true, Relaxed);
+    append(
+        msg,
+        dbg_fname,
+        ERR_LOG_DIR_NAME);
+    panic!("{}", msg);
 }
 
-const GRACEFUL_SHUTDOWN: &str = "Error: got Ok(0) read on ";
+/// returns true if the error is Interrupted, WouldBlock, TimedOut, else returns false.
+#[inline]
+fn is_io_err_minor(err: &io::Error) -> bool {
+    match err.kind() {
+        Interrupted => true,
+        WouldBlock => true,
+        TimedOut => true, 
+        _ => false, 
+    }
+}
 
 struct SockReaderFdWriter<T: Write + Send> {
     stream: UnixStream,
@@ -142,7 +148,7 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
         let mut cursor: usize;
 
         loop {
-            if self.kill.load(SeqCst) { panic!() }
+            if self.kill.load(SeqCst) { panic!("{}", MSG_KILL_TRIG) }
             cursor = HEADER_LEN;
 
             match self.stream.read(&mut buf[cursor..]) {
@@ -150,20 +156,15 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
                     if nb != 0 {
                         cursor += nb;
                     } else { 
-                        kill_thread(
-                            &self.kill, Self::DEBUG_FNAME,
-                            &format!("{}{}", GRACEFUL_SHUTDOWN, Self::DEBUG_FNAME));
+                        kill_thread(&self.kill, Self::DEBUG_FNAME, GRACEFUL_SHUTDOWN);
                     } 
                 }
 
-                Err(e) => {
-                    let ek = e.kind(); 
-                    if ek == WouldBlock || ek == Interrupted || ek == TimedOut { 
-                        continue; 
-                    } else {
-                        kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
-                    }
+                Err(ref e) if is_io_err_minor(e) => {
+                    continue; 
                 }
+
+                Err(e) => kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()),
             }
 
             buf[..HEADER_LEN].copy_from_slice(&MsgHeader::new(cursor as u64).0);
@@ -201,172 +202,69 @@ struct SockWriterFdReader<T: Read> {
 
 impl<T: Read + Send> SockWriterFdReader<T> {
     const DEBUG_FNAME: &str = "SockWriterFdReader";
-    const MSG_KILL_TRIG: &str = "Error: kill flag triggered";
 
-    pub fn spawn(self) {
+    pub fn spawn(mut self) {
         let mut buf = [0u8; KIB64];
         let mut header = [0u8; HEADER_LEN];
-        let mut overflow: Option<OFIdx> = None;
-        let mut cursor = 0usize; 
+        let mut cursor: usize;
         let mut msg_len;
-        let mut stream;
-        let mut stream_res;
 
         loop {
+            cursor = 0; 
+
             if self.kill.load(SeqCst) { 
-                panic!("{}", Self::MSG_KILL_TRIG) 
+                panic!("{}", MSG_KILL_TRIG) 
             }
 
             while cursor < HEADER_LEN {
-                match fd.read(&mut buf[cursor..]) {
+                match self.fd.read(&mut buf[cursor..]) {
                     Ok(nb) => {
                         if nb != 0 {
                             cursor += nb; 
-                        } 
+                        } else {
+                            kill_thread(&self.kill, Self::DEBUG_FNAME, GRACEFUL_SHUTDOWN);
+                        }
                     }
-                    Err(e) if e.kind() == 
-                        io::ErrorKind::Interrupted => continue,
-                    Err(e) if e.kind() == 
-                        io::ErrorKind::ConnectionReset => {
-                        self.kill.store(true, SeqCst);
-                        let msg = Model::QREXEC_ECONNRESET;
-                        debug_err_append(
-                            &Err::<T, anyhow::Error>(anyhow!(msg)),
-                            Self::DEBUG_FNAME,
-                            ERR_LOG_DIR_NAME);
-                        panic!("{}", msg);
-                    }
-                    Err(e) => {
-                        debug_err_append(
-                            &Err::<(), io::Error>(e),
-                            Self::DEBUG_FNAME,
-                            ERR_LOG_DIR_NAME);
-                        cursor = 0;
-                        continue 'top;
-                    }
+
+                    Err(ref e) if is_io_err_minor(e) => continue,
+
+                    Err(e) => kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()),
                 }
             }
 
-            // msg_len includes the header in the new implementation
-            // this is why HEADER_LEN is not added to msg_len to account
-            // for the cursor header bytes which have been read. 
             header.clone_from_slice(&buf[..HEADER_LEN]);
-            msg_len = MsgHeader::len(header); 
-            while (cursor as u64) < msg_len {
-                match fd.read(&mut buf[cursor..]) {
+            msg_len = MsgHeader::len(header) as usize; 
+
+            while cursor < msg_len {
+                match self.fd.read(&mut buf[cursor..]) {
                     Ok(nb) => { 
                         if nb != 0 {
                             cursor += nb;
                         } 
                     } 
-                    Err(e) if e.kind() ==
-                        io::ErrorKind::Interrupted => continue,
-                    Err(e) if e.kind() == 
-                        io::ErrorKind::ConnectionReset => {
-                        self.kill.store(true, SeqCst);
-                        let msg = Model::QREXEC_ECONNRESET;
-                        debug_err_append(
-                            &Err::<T, anyhow::Error>(anyhow!(msg)),
-                            Self::DEBUG_FNAME,
-                            ERR_LOG_DIR_NAME);
-                        panic!("{}", msg);
-                    }
-                    Err(e) => {
-                        debug_err_append(
-                            &Err::<(), io::Error>(e),
-                            Self::DEBUG_FNAME,
-                            ERR_LOG_DIR_NAME);
-                        cursor = 0;
-                        continue 'top;
-                    }
+
+                    Err(ref e) if is_io_err_minor(e) => continue,
+
+                    Err(e) => kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()),
                 }
             }
 
-            drop(fd);
-            if cursor as u64 > msg_len {
-                overflow = Some(OFIdx {
-                    start: msg_len as usize,
-                    end: cursor });
-            } else {
-                overflow = None;
-            }
-
-            stream_res = self.stream.lock();
-            debug_err_append(
-                &stream_res,
-                Self::DEBUG_FNAME,
-                ERR_LOG_DIR_NAME);
-            stream = stream_res.unwrap();
 
             cursor = HEADER_LEN;
-            while cursor < (msg_len as usize) {
-                match stream.write(&buf[cursor..(msg_len as usize)]) {
-                    Ok(nb) => { 
-                        cursor += nb;
-                        continue;
-                    }
-                    Err(e) if e.kind() ==
-                        io::ErrorKind::WouldBlock => {
-                        drop(stream);
-                        stream_res = self.stream.lock();
-                        debug_err_append(
-                            &stream_res,
-                            Self::DEBUG_FNAME,
-                            ERR_LOG_DIR_NAME);
-                        stream = stream_res.unwrap();
-                        continue;
-                    }
-                    Err(e) if e.kind() ==
-                        io::ErrorKind::Interrupted => {
-                        drop(stream);
-                        stream_res = self.stream.lock();
-                        debug_err_append(
-                            &stream_res,
-                            Self::DEBUG_FNAME,
-                            ERR_LOG_DIR_NAME);
-                        stream = stream_res.unwrap();
-                        continue;
-                    }
-                    Err(e) if e.kind() ==
-                        io::ErrorKind::BrokenPipe => {
-                        match self.model {
-                            Model::Client => {
-                                let _ = self.reset_conn.compare_exchange(
-                                    false, true, SeqCst, SeqCst);
-                                drop(stream);
-                                while self.reset_conn.load(SeqCst){}
-                                stream_res = self.stream.lock();
-                                debug_err_append(
-                                    &stream_res,
-                                    Self::DEBUG_FNAME,
-                                    ERR_LOG_DIR_NAME);
-                                stream = stream_res.unwrap();
-                                continue;
-                            }
-                            Model::Vault => {
-                                self.kill.store(true, SeqCst);
-                                let msg = e.to_string();
-                                debug_err_append(
-                                    &Err::<T, io::Error>(e),
-                                    Self::DEBUG_FNAME,
-                                    ERR_LOG_DIR_NAME);
-                                panic!("{}", msg);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        debug_err_append(
-                            &Err::<T, io::Error>(e),
-                            Self::DEBUG_FNAME,
-                            ERR_LOG_DIR_NAME);
-                        continue 'top;
-                    }
+
+            while cursor < msg_len {
+                match self.stream.write(&buf[cursor..msg_len]) {
+                    Ok(nb) => cursor += nb,
+                    
+                    Err(ref e) if is_io_err_minor(e) => continue,
+
+                    Err(e) => kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()),
                 }
             } 
 
-            let _ = stream.flush();
-            drop(stream);
-            cursor = 0;
+            if let Err(e) = self.stream.flush() {
+                kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
+            }
         }
     }
 }
@@ -393,9 +291,6 @@ fn touts(stream: &UnixStream) -> Result<(), io::Error> {
 }
 
 const SOCK_VAR: &str = "SSH_AUTH_SOCK";
-const _SLEEP_DURATION_CTRL: Duration = Duration::from_secs(3);
-const DBG_FNAME_MAIN: &str = "Main";
-const MUTEX_ERR: &str = "Error: poisened UnixStream Mutex...";
 const THREAD_ERR: &str = "Error: at least one of the threads failed";
 
 fn finish_check(conn: &SockStdInOutCon) -> bool {
@@ -427,26 +322,14 @@ impl SockStream {
         written: T,
         read: U,
     ) -> Result<(), anyhow::Error> where
-        T: Write + Send + Sync + 'static,
-        U: Read + Send + Sync + 'static, 
+        T: Write + Send + 'static,
+        U: Read + Send + 'static, 
     {
-        let (written, read) = (
-            Arc::new(Mutex::new(written)),
-            Arc::new(Mutex::new(read)));
-        let ctrl = SockStdInOutCon::spawn(
-            Arc::new(Mutex::new(self.0)),
-            written,
-            read,
-            Model::Vault);
+        let handle = SockStdInOutCon::spawn(self.0, written, read);
 
         loop {
-            if finish_check(&ctrl) { 
-                let thread_err = Err(anyhow!(THREAD_ERR));
-                debug_err_append(
-                    &thread_err,
-                    DBG_FNAME_MAIN,
-                    ERR_LOG_DIR_NAME);
-                return thread_err;
+            if finish_check(&handle) { 
+                Err(anyhow!(THREAD_ERR))?;
             }
         } 
     }  
@@ -477,11 +360,11 @@ impl SockListener {
         written: T,
         read: U,
     ) -> DynError<()> where
-        T: Write + Send,
-        U: Read + Send, 
+        T: Write + Send + 'static,
+        U: Read + Send + 'static, 
     {
         let stream = stream_and_touts(&self.0)?;
-        let thread_ctrl = SockStdInOutCon::spawn(self, stream, written, read);
+        let thread_ctrl = SockStdInOutCon::spawn(stream, written, read);
         loop { 
             if finish_check(&thread_ctrl) {
                 Err(anyhow!(THREAD_ERR))? 
