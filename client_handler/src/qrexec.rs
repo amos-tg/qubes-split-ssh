@@ -2,7 +2,8 @@ use crate::{
     DynError,
     ERR_LOG_DIR_NAME,
 };
-use socket_stdinout::debug::debug_err_append;
+
+use socket_stdinout::debug::append;
 use std::{
     ops::{
         Deref,
@@ -68,13 +69,15 @@ impl QRExecProc {
         "Error: failed to produce a stderr for qrexec child proc.";
 
     pub fn new() -> DynError<Self> { 
-        let remote_vm = {
-            let var = env::var(Self::VAULT_VM_NAME_ENV);
-            debug_err_append(
-                &var,
-                DEBUG_FNAME,
-                ERR_LOG_DIR_NAME);
-            var?
+        let remote_vm = match env::var(Self::VAULT_VM_NAME_ENV) {
+            Ok(name) => name,
+            Err(e) => {
+                append(
+                    &e.to_string(),
+                    DEBUG_FNAME,
+                    ERR_LOG_DIR_NAME);
+                return Err(e.into());
+            }
         };
 
         let mut child = DropChild(Command::new("qrexec-client-vm")
