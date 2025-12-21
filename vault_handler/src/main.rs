@@ -10,29 +10,26 @@ use socket_stdinout::{
 const DEBUG_FNAME: &str = "Main";
 
 fn main() -> DynError<()> {
-    let (stdin, stdout) = (
-        io::stdin(),  
-        io::stdout());
+    let (stdin, stdout) = (io::stdin(), io::stdout());
 
-    let listener = {
-        let sock_res = sock::SockStream::new();
-        append(
-            &sock_res.to_string(),
-            DEBUG_FNAME,
-            ERR_LOG_DIR_NAME);
-        sock_res?
+    let listener = match sock::SockStream::new() {
+        Ok(listener) => listener,
+        Err(e) => {
+            append(
+                &e.to_string(),
+                DEBUG_FNAME,
+                ERR_LOG_DIR_NAME);
+            return Err(e);
+        }
     };
 
-    let conn_res = listener.handle_connections(
-        stdout, 
-        stdin);
-
-    append(
-        &conn_res.to_string(),
-        DEBUG_FNAME,
-        ERR_LOG_DIR_NAME);
-
-    conn_res?;
+    if let Err(e) = listener.handle_connections(stdout, stdin) {
+        append(
+            &e.to_string(),
+            DEBUG_FNAME,
+            ERR_LOG_DIR_NAME);
+        return Err(e.into());
+    }
 
     return Ok(());
 }
