@@ -4,40 +4,42 @@ use crate::qrexec::QRExecProc;
 use socket_stdinout::{
     self as sock,
     types::DynError,
-    debug::debug_err_append,
+    debug::append,
     ERR_LOG_DIR_NAME,
 };
 
 const DEBUG_FNAME: &str = "Main";
 
 fn main() -> DynError<()> {
-    let qrexec = {
-        let qrexec_res = QRExecProc::new();
-        append(
-            &qrexec_res.to_string(),
-            DEBUG_FNAME,
-            ERR_LOG_DIR_NAME);
-        qrexec_res?
+    let qrexec = match QRExecProc::new() {
+        Ok(qrexec) => qrexec,
+        Err(e) => {
+            append(
+                &e.to_string(),
+                DEBUG_FNAME,
+                ERR_LOG_DIR_NAME);
+            return Err(e);   
+        }
     };
 
-    let stream = {
-        let stream_res = sock::SockListener::new();
-        append(
-            &stream_res.to_string(),
-            DEBUG_FNAME,
-            ERR_LOG_DIR_NAME);
-        stream_res?
+    let stream = match sock::SockListener::new() {
+        Ok(stream) => stream, 
+        Err(e) => {
+            append(
+                &e.to_string(),
+                DEBUG_FNAME,
+                ERR_LOG_DIR_NAME);
+            return Err(e);
+        }
     };
 
-    let conn_res = stream.handle_connections(
-        qrexec.stdin,
-        qrexec.stdout);
-
-    append(
-        &conn_res.to_string(),
-        DEBUG_FNAME,
-        ERR_LOG_DIR_NAME);
-    conn_res?;
+    if let Err(e) = stream.handle_connections(qrexec.stdin, qrexec.stdout) {
+        append(
+            &e.to_string(),
+            DEBUG_FNAME,
+            ERR_LOG_DIR_NAME);
+        return Err(e);
+    }
 
     return Ok(());
 }
