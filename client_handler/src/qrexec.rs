@@ -60,7 +60,7 @@ pub struct QRExecProc {
 
 impl QRExecProc {
     const VAULT_VM_NAME_ENV: &str = "SSH_VAULT_VM";
-    const RPC_SERVICE_NAME: &str = "qubes.SshAgent";
+    const RPC_SERVICE_NAME: &str = "qubes.SplitSSHAgent";
     const STDIN_ERR: &str = 
         "Error: failed to produce a stdin for qrexec child proc.";
     const STDOUT_ERR: &str = 
@@ -92,10 +92,13 @@ impl QRExecProc {
 
         let stdin = child.stdin.take().ok_or(
             anyhow!(Self::STDIN_ERR))?;
+
         let stdout = child.stdout.take().ok_or(
             anyhow!(Self::STDOUT_ERR))?;
+
         let stderr = child.stderr.take().ok_or(
             anyhow!(Self::STDERR_ERR))?;
+
         return Ok(Self {
             _child: child, 
             stdin,
