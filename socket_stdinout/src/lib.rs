@@ -1,3 +1,4 @@
+mod data;
 mod msg_header;
 pub mod debug;
 pub mod types;
@@ -5,6 +6,7 @@ pub mod types;
 use types::DynError;
 use debug::append;
 use msg_header::{MsgHeader, HEADER_LEN};
+use data::CRwLock;
 
 use std::{
     fs,
@@ -19,6 +21,7 @@ use std::{
             Interrupted, 
             WouldBlock,
             TimedOut,
+            BrokenPipe,
         },
     },
     sync::{
@@ -35,6 +38,7 @@ use anyhow::anyhow;
 
 pub const ERR_LOG_DIR_NAME: &str = "split-ssh";
 const KIB64: usize = 65536;
+const NUM_THREADS: usize = 2;
 
 type Thread = JoinHandle<()>;
 
@@ -43,6 +47,7 @@ pub struct SockStdInOutCon {
     kill: Arc<AtomicBool>,
     sock_reader_fd_writer: Thread,
     sock_writer_fd_reader: Thread,
+    new_stream: Arc<CRwLock<UnixStream, NUM_THREADS>>,
 }
 
 impl<'a> SockStdInOutCon {
@@ -59,6 +64,15 @@ impl<'a> SockStdInOutCon {
         U: Read + Send + 'static,
     {
         let kill = Arc::new(AtomicBool::new(false));
+
+        let new_stream = { 
+            let stream = stream.try_clone();
+            if let Err(ref e) = stream { 
+                kill_thread(&kill, Self::DEBUG_FNAME, &e.to_string());
+            }
+            Arc::new(CRwLock::<UnixStream, NUM_THREADS>::new(stream.unwrap()))
+        };
+
         let srfw_stream = { 
             let stream = stream.try_clone();
             if let Err(ref e) = stream { 
@@ -69,6 +83,7 @@ impl<'a> SockStdInOutCon {
 
         let sock_reader_fd_writer = {
             let srfw = SockReaderFdWriter {
+                new_stream: new_stream.clone(),
                 stream: srfw_stream,
                 fd: written,
                 kill: kill.clone(),
@@ -82,6 +97,7 @@ impl<'a> SockStdInOutCon {
 
         let sock_writer_fd_reader = {
             let swfr = SockWriterFdReader {
+                new_stream: new_stream.clone(),
                 stream: stream,
                 fd: read,
                 kill: kill.clone(),
@@ -97,6 +113,7 @@ impl<'a> SockStdInOutCon {
             kill,
             sock_reader_fd_writer, 
             sock_writer_fd_reader,
+            new_stream,
         }
     }
 }
@@ -107,7 +124,6 @@ impl Drop for SockStdInOutCon {
     }
 }
 
-const GRACEFUL_SHUTDOWN: &str = "Error: got Ok(0) read on ";
 const MSG_KILL_TRIG: &str = "Error: kill flag triggered";
 
 fn kill_thread(
@@ -115,7 +131,7 @@ fn kill_thread(
     dbg_fname: &str,
     msg: &str,
 ) {
-    kill.store(true, Relaxed);
+    kill.store(true, SeqCst);
     append(
         msg,
         dbg_fname,
@@ -135,6 +151,7 @@ fn is_io_err_minor(err: &io::Error) -> bool {
 }
 
 struct SockReaderFdWriter<T: Write + Send> {
+    new_stream: Arc<CRwLock<UnixStream, NUM_THREADS>>,
     stream: UnixStream,
     fd: T,
     kill: Arc<AtomicBool>,   
@@ -147,6 +164,20 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
         let mut msg_len: usize;
         let mut cursor: usize;
 
+        'new_stream: loop {
+            if self.new_stream.count().load(SeqCst) != 0 {
+                let new_stream_guard = self.new_stream.read();
+                if let Err(ref e) = new_stream_guard {
+                    kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
+                }
+
+                let new_stream_res = (*(new_stream_guard.unwrap())).try_clone();
+                if let Err(ref e) = new_stream_res {
+                    kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
+                }
+
+                self.stream = new_stream_res.unwrap();
+            } 
         loop {
             if self.kill.load(SeqCst) { panic!("{}", MSG_KILL_TRIG) }
             cursor = HEADER_LEN;
@@ -156,7 +187,7 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
                     if nb != 0 {
                         cursor += nb;
                     } else { 
-                        kill_thread(&self.kill, Self::DEBUG_FNAME, GRACEFUL_SHUTDOWN);
+                        continue 'new_stream;
                     } 
                 }
 
@@ -190,11 +221,12 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
             if let Err(e) = flush_res {
                 kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
             }
-        }
+        }}
     }
 }
 
 struct SockWriterFdReader<T: Read> {
+    new_stream: Arc<CRwLock<UnixStream, NUM_THREADS>>,
     stream: UnixStream,
     fd: T, 
     kill: Arc<AtomicBool>,
@@ -209,6 +241,20 @@ impl<T: Read + Send> SockWriterFdReader<T> {
         let mut cursor: usize;
         let mut msg_len;
 
+        'new_stream: loop {
+            if self.new_stream.count().load(SeqCst) != 0 {
+                let new_stream_guard = self.new_stream.read();
+                if let Err(ref e) = new_stream_guard {
+                    kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
+                }
+
+                let new_stream_res = (*(new_stream_guard.unwrap())).try_clone();
+                if let Err(ref e) = new_stream_res {
+                    kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
+                }
+
+                self.stream = new_stream_res.unwrap();
+            } 
         loop {
             cursor = 0; 
 
@@ -222,7 +268,7 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                         if nb != 0 {
                             cursor += nb; 
                         } else {
-                            kill_thread(&self.kill, Self::DEBUG_FNAME, GRACEFUL_SHUTDOWN);
+                            continue;
                         }
                     }
 
@@ -258,6 +304,8 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                     
                     Err(ref e) if is_io_err_minor(e) => continue,
 
+                    Err(e) if e.kind() == BrokenPipe => continue 'new_stream, 
+
                     Err(e) => kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()),
                 }
             } 
@@ -265,7 +313,7 @@ impl<T: Read + Send> SockWriterFdReader<T> {
             if let Err(e) = self.stream.flush() {
                 kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
             }
-        }
+        }}
     }
 }
 
@@ -338,6 +386,8 @@ impl SockStream {
 pub struct SockListener(UnixListener);
 
 impl SockListener {
+    const DEBUG_FNAME: &str = "Controller";
+
     // used by the client side
     pub fn new() -> DynError<Self> {
         let path = env::var(SOCK_VAR)?;
@@ -365,12 +415,27 @@ impl SockListener {
     {
         let stream = stream_and_touts(&self.0)?;
         let thread_ctrl = SockStdInOutCon::spawn(stream, written, read);
+        self.0.set_nonblocking(true)?;
+
+        let mut conn_queue = Vec::with_capacity(5);
+        let recv_counter = thread_ctrl.new_stream.count();
         loop { 
             if finish_check(&thread_ctrl) {
                 Err(anyhow!(THREAD_ERR))? 
             }
 
-            thread::park_timeout(Duration::from_secs(10));
+            match self.0.accept() {
+                Ok((conn, _)) => conn_queue.push(conn),
+
+                Err(ref e) if e.kind() == WouldBlock => continue,
+
+                Err(e) => kill_thread(
+                    &thread_ctrl.kill, Self::DEBUG_FNAME, &e.to_string()),
+            }
+
+            if !conn_queue.is_empty() && recv_counter.load(SeqCst) == 0 {
+                thread_ctrl.new_stream.replace(conn_queue.pop().unwrap())?;
+            };
         }
     } 
 }
