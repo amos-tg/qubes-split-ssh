@@ -19,6 +19,7 @@ pub struct CRwLock<T, const NUM_RX: usize> {
 }
 
 impl<T, const NUM_RX: usize> CRwLock<T, NUM_RX> {
+    /// Counter starts at zero
     pub fn new(data: T) -> Self {
         let data = RwLock::new(data);
         let counter = AtomicUsize::new(0usize);

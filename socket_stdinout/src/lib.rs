@@ -195,10 +195,12 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
                     continue; 
                 }
 
-                Err(e) => kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()),
+                Err(e) => kill_thread(
+                    &self.kill, Self::DEBUG_FNAME, &e.to_string()),
             }
 
-            buf[..HEADER_LEN].copy_from_slice(&MsgHeader::new(cursor as u64).0);
+            buf[..HEADER_LEN].copy_from_slice(
+                &MsgHeader::new(cursor as u64).0);
             msg_len = cursor;
             cursor = 0;
 
@@ -206,14 +208,10 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
                 match self.fd.write(&buf[cursor..msg_len]) {
                     Ok(n_bytes) => cursor += n_bytes,
 
-                    Err(err) => { 
-                        let ek = err.kind(); 
-                        if ek == WouldBlock || ek == Interrupted || ek == TimedOut { 
-                            continue; 
-                        } else {
-                            kill_thread(&self.kill, Self::DEBUG_FNAME, &err.to_string());
-                        }
-                    }
+                    Err(ref e) if is_io_err_minor(e) => continue,
+
+                    Err(e) => kill_thread(
+                        &self.kill, Self::DEBUG_FNAME, &e.to_string()),
                 }
             }
 
@@ -427,15 +425,15 @@ impl SockListener {
             match self.0.accept() {
                 Ok((conn, _)) => conn_queue.push(conn),
 
-                Err(ref e) if e.kind() == WouldBlock => continue,
+                Err(ref e) if e.kind() == WouldBlock => (),
 
                 Err(e) => kill_thread(
                     &thread_ctrl.kill, Self::DEBUG_FNAME, &e.to_string()),
             }
 
-            if !conn_queue.is_empty() && recv_counter.load(SeqCst) == 0 {
+            if !conn_queue.is_empty() {
                 thread_ctrl.new_stream.replace(conn_queue.pop().unwrap())?;
-            };
+            }
         }
     } 
 }
