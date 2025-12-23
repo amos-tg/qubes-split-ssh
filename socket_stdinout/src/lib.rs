@@ -252,7 +252,8 @@ impl<T: Read + Send> SockWriterFdReader<T> {
         let mut msg_len;
 
         'new_stream: loop {
-            if self.new_stream.count().load(SeqCst) != 0 
+            let counter = self.new_stream.count();
+            if counter.load(SeqCst) != 0 
                 && self.model == Model::Client 
             {
                 let new_stream_guard = self.new_stream.read();
@@ -266,6 +267,8 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                 }
 
                 self.stream = new_stream_res.unwrap();
+
+                let _ = counter.fetch_sub(1, SeqCst);
             } 
         loop {
             cursor = 0; 
@@ -444,7 +447,9 @@ impl SockListener {
                     &thread_ctrl.kill, Self::DEBUG_FNAME, &e.to_string()),
             }
 
-            if !conn_queue.is_empty() {
+            if !conn_queue.is_empty() 
+                && thread_ctrl.new_stream.count().load(SeqCst) == 0 
+            {
                 thread_ctrl.new_stream.replace(conn_queue.pop().unwrap())?;
             }
         }
