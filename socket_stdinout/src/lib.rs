@@ -42,6 +42,11 @@ const NUM_THREADS: usize = 2;
 
 type Thread = JoinHandle<()>;
 
+#[derive(PartialEq, Clone)]
+enum Model {
+    Client,
+    Server,
+}
 
 pub struct SockStdInOutCon {
     kill: Arc<AtomicBool>,
@@ -59,6 +64,7 @@ impl<'a> SockStdInOutCon {
         stream: UnixStream,
         written: T,
         read: U,
+        model: Model,
     ) -> Self where
         T: Write + Send + 'static,
         U: Read + Send + 'static,
@@ -87,6 +93,7 @@ impl<'a> SockStdInOutCon {
                 stream: srfw_stream,
                 fd: written,
                 kill: kill.clone(),
+                model: model.clone(),
             };
 
             thread::Builder::new()
@@ -101,6 +108,7 @@ impl<'a> SockStdInOutCon {
                 stream: stream,
                 fd: read,
                 kill: kill.clone(),
+                model,
             };
 
             thread::Builder::new()
@@ -155,6 +163,7 @@ struct SockReaderFdWriter<T: Write + Send> {
     stream: UnixStream,
     fd: T,
     kill: Arc<AtomicBool>,   
+    model: Model,
 }
 
 impl<T: Write + Send> SockReaderFdWriter<T> {
@@ -165,7 +174,9 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
         let mut cursor: usize;
 
         'new_stream: loop {
-            if self.new_stream.count().load(SeqCst) != 0 {
+            if self.new_stream.count().load(SeqCst) != 0
+                && self.model == Model::Client 
+            {
                 let new_stream_guard = self.new_stream.read();
                 if let Err(ref e) = new_stream_guard {
                     kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
@@ -228,6 +239,7 @@ struct SockWriterFdReader<T: Read> {
     stream: UnixStream,
     fd: T, 
     kill: Arc<AtomicBool>,
+    model: Model,
 }
 
 impl<T: Read + Send> SockWriterFdReader<T> {
@@ -240,7 +252,9 @@ impl<T: Read + Send> SockWriterFdReader<T> {
         let mut msg_len;
 
         'new_stream: loop {
-            if self.new_stream.count().load(SeqCst) != 0 {
+            if self.new_stream.count().load(SeqCst) != 0 
+                && self.model == Model::Client 
+            {
                 let new_stream_guard = self.new_stream.read();
                 if let Err(ref e) = new_stream_guard {
                     kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
@@ -371,7 +385,7 @@ impl SockStream {
         T: Write + Send + 'static,
         U: Read + Send + 'static, 
     {
-        let handle = SockStdInOutCon::spawn(self.0, written, read);
+        let handle = SockStdInOutCon::spawn(self.0, written, read, Model::Server);
 
         loop {
             if finish_check(&handle) { 
@@ -412,11 +426,10 @@ impl SockListener {
         U: Read + Send + 'static, 
     {
         let stream = stream_and_touts(&self.0)?;
-        let thread_ctrl = SockStdInOutCon::spawn(stream, written, read);
+        let thread_ctrl = SockStdInOutCon::spawn(stream, written, read, Model::Client);
         self.0.set_nonblocking(true)?;
 
         let mut conn_queue = Vec::with_capacity(5);
-        let recv_counter = thread_ctrl.new_stream.count();
         loop { 
             if finish_check(&thread_ctrl) {
                 Err(anyhow!(THREAD_ERR))? 
