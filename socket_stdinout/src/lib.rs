@@ -5,7 +5,12 @@ pub mod types;
 
 use types::DynError;
 use debug::append;
-use msg_header::{MsgHeader, HEADER_LEN};
+use msg_header::{
+    MsgHeader,
+    HEADER_LEN,
+    flags::*,
+    FLAGS_INDEX,
+};
 use data::CRwLock;
 
 use std::{
@@ -24,6 +29,7 @@ use std::{
             BrokenPipe,
         },
     },
+    net::Shutdown,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering::*},
@@ -158,6 +164,28 @@ fn is_io_err_minor(err: &io::Error) -> bool {
     }
 }
 
+fn load_new_stream(
+    kill: &AtomicBool, debug_fname: &str, 
+    new_stream: &CRwLock<UnixStream, NUM_THREADS>, stream: &mut UnixStream,
+) {
+    if new_stream.count().load(SeqCst) != 0 {
+        let new_stream_guard = new_stream.read();
+        if let Err(ref e) = new_stream_guard {
+            kill_thread(kill, debug_fname, &e.to_string());
+        }
+
+        let new_stream_res = (*(new_stream_guard.unwrap())).try_clone();
+
+        if let Err(ref e) = new_stream_res {
+            kill_thread(kill, debug_fname, &e.to_string());
+        }
+
+        *stream = new_stream_res.unwrap();
+
+        return;    
+    } 
+} 
+
 struct SockReaderFdWriter<T: Write + Send> {
     new_stream: Arc<CRwLock<UnixStream, NUM_THREADS>>,
     stream: UnixStream,
@@ -168,27 +196,21 @@ struct SockReaderFdWriter<T: Write + Send> {
 
 impl<T: Write + Send> SockReaderFdWriter<T> {
     const DEBUG_FNAME: &str = "SockReaderFdWriter";
+
     pub fn spawn(mut self) { 
         let mut buf = [0u8; KIB64];
         let mut msg_len: usize;
         let mut cursor: usize;
+        let mut header = MsgHeader::new();
 
-        'new_stream: loop {
-            if self.new_stream.count().load(SeqCst) != 0
-                && self.model == Model::Client 
-            {
-                let new_stream_guard = self.new_stream.read();
-                if let Err(ref e) = new_stream_guard {
-                    kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
-                }
+        'reconn: loop {
+            load_new_stream(
+                &self.kill, Self::DEBUG_FNAME, 
+                &self.new_stream, &mut self.stream); 
 
-                let new_stream_res = (*(new_stream_guard.unwrap())).try_clone();
-                if let Err(ref e) = new_stream_res {
-                    kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
-                }
-
-                self.stream = new_stream_res.unwrap();
-            } 
+            if self.model == Model::Client {
+                self.send_disconn_msg();
+            }
         loop {
             if self.kill.load(SeqCst) { panic!("{}", MSG_KILL_TRIG) }
             cursor = HEADER_LEN;
@@ -198,7 +220,7 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
                     if nb != 0 {
                         cursor += nb;
                     } else { 
-                        continue 'new_stream;
+                        continue 'reconn;
                     } 
                 }
 
@@ -210,8 +232,8 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
                     &self.kill, Self::DEBUG_FNAME, &e.to_string()),
             }
 
-            buf[..HEADER_LEN].copy_from_slice(
-                &MsgHeader::new(cursor as u64).0);
+            header.update(cursor as u64, NONE);
+            buf[..HEADER_LEN].copy_from_slice(&*header);
             msg_len = cursor;
             cursor = 0;
 
@@ -232,6 +254,26 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
             }
         }}
     }
+
+    fn send_disconn_msg(&mut self) {
+        const EMPTY: u64 = 0;
+
+        let mut cursor = 0; 
+        let mut header = MsgHeader::new();  
+
+        header.update(EMPTY, RECONN);
+        
+
+        while cursor < HEADER_LEN {
+            match self.fd.write(&*header) {
+                Ok(nb) => cursor += nb, 
+
+                Err(ref e) if is_io_err_minor(e) => continue, 
+
+                Err(e) => kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()),
+            }
+        }
+    } 
 }
 
 struct SockWriterFdReader<T: Read> {
@@ -247,28 +289,31 @@ impl<T: Read + Send> SockWriterFdReader<T> {
 
     pub fn spawn(mut self) {
         let mut buf = [0u8; KIB64];
-        let mut header = [0u8; HEADER_LEN];
+        let mut header = MsgHeader::new();
         let mut cursor: usize;
         let mut msg_len;
 
-        'new_stream: loop {
-            let counter = self.new_stream.count();
-            if counter.load(SeqCst) != 0 
-                && self.model == Model::Client 
-            {
-                let new_stream_guard = self.new_stream.read();
-                if let Err(ref e) = new_stream_guard {
-                    kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
+        'reconn: loop {
+            match self.model {
+                Model::Client => {
+                    // This can kill the thread on failure
+                    load_new_stream(
+                        &self.kill, Self::DEBUG_FNAME,
+                        &self.new_stream, &mut self.stream);
                 }
 
-                let new_stream_res = (*(new_stream_guard.unwrap())).try_clone();
-                if let Err(ref e) = new_stream_res {
-                    kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
+                Model::Server => {
+                    if let Err(e) = self.disconn_ssh_agent() {
+                        kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
+                    }   
+
+                    // supposedly ssh-agent connections don't timeout by default 
+                    // so it's fine in this case to wait an indeterminate amount
+                    // of time for the next connection.
+                    if let Err(e) = self.reconn_ssh_agent() {
+                        kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
+                    }   
                 }
-
-                self.stream = new_stream_res.unwrap();
-
-                let _ = counter.fetch_sub(1, SeqCst);
             } 
         loop {
             cursor = 0; 
@@ -293,8 +338,12 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                 }
             }
 
+            if header[FLAGS_INDEX] == RECONN {
+                continue 'reconn;
+            }
+
             header.clone_from_slice(&buf[..HEADER_LEN]);
-            msg_len = MsgHeader::len(header) as usize; 
+            msg_len = header.len() as usize; 
 
             while cursor < msg_len {
                 match self.fd.read(&mut buf[cursor..]) {
@@ -310,7 +359,6 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                 }
             }
 
-
             cursor = HEADER_LEN;
 
             while cursor < msg_len {
@@ -319,7 +367,7 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                     
                     Err(ref e) if is_io_err_minor(e) => continue,
 
-                    Err(e) if e.kind() == BrokenPipe => continue 'new_stream, 
+                    Err(e) if e.kind() == BrokenPipe => continue 'reconn, 
 
                     Err(e) => kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()),
                 }
@@ -329,6 +377,26 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                 kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
             }
         }}
+    }
+
+    /// shuts down the read and right halves of the UnixStream
+    /// in self.stream.
+    #[inline]
+    fn disconn_ssh_agent(&mut self) -> io::Result<()> {
+        self.stream.shutdown(Shutdown::Both)?; 
+        return Ok(());
+    }
+
+    /// Gets a new connection to the ssh-agent; blocks until the new 
+    /// connection is acquired. Timeouts are applied to the ssh-agent 
+    /// with the touts function. The new connection to the ssh-agent
+    /// calls replace on self.new_stream to ensure that both of the 
+    /// IO manager threads get proper access. 
+    fn reconn_ssh_agent(&mut self) -> DynError<()> {
+        let sock = conn_ssh_agent()?; 
+        touts(&sock)?;
+        self.new_stream.replace(sock)?;
+        return Ok(());
     }
 }
 
@@ -346,10 +414,8 @@ fn stream_and_touts(
 #[inline(always)]
 fn touts(stream: &UnixStream) -> Result<(), io::Error> {
     const TOUT_SECS: Duration = Duration::from_secs(2);
-    stream.set_read_timeout(
-        Some(TOUT_SECS))?; 
-    stream.set_write_timeout(
-        Some(TOUT_SECS))?;
+    stream.set_read_timeout(Some(TOUT_SECS))?; 
+    stream.set_write_timeout(Some(TOUT_SECS))?;
     return Ok(());
 }
 
@@ -357,9 +423,25 @@ const SOCK_VAR: &str = "SSH_AUTH_SOCK";
 const THREAD_ERR: &str = "Error: at least one of the threads failed";
 
 fn finish_check(conn: &SockStdInOutCon) -> bool {
-    if conn.sock_reader_fd_writer.is_finished() { return true }
-    if conn.sock_writer_fd_reader.is_finished() { return true }
-    return false;
+    if conn.sock_reader_fd_writer.is_finished() || 
+        conn.sock_writer_fd_reader.is_finished() 
+    { 
+        return true; 
+    } else {
+        return false;
+    }
+}
+
+fn conn_ssh_agent() -> DynError<UnixStream> {
+    let path = env::var(SOCK_VAR)?;
+    let sock = if fs::exists(&path)? {
+        UnixStream::connect(&path)?
+    } else {
+        return Err(anyhow!(
+            "Error: ssh-agent socket doesn't exist to connect to"
+        ).into());
+    };
+    return Ok(sock);
 }
 
 pub struct SockStream(UnixStream);
@@ -367,15 +449,7 @@ pub struct SockStream(UnixStream);
 impl SockStream {
     // SockStream is used on the vault side
     pub fn new() -> DynError<Self> {
-        let path = env::var(SOCK_VAR)?;
-        let sock = if fs::exists(&path)? {
-            UnixStream::connect(&path)?
-        } else {
-            return Err(anyhow!(
-                "Error: the socket doesn't exist to connect to"
-            ).into());
-        };
-
+        let sock = conn_ssh_agent()?;
         touts(&sock)?;
         return Ok(Self(sock));
     }
