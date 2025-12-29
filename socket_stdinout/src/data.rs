@@ -37,7 +37,6 @@ impl<T, const NUM_RX: usize> CRwLock<T, NUM_RX> {
     /// 
     /// This function blocks until it writes the new: T value into
     /// the inner RwLock<T>.
-    #[inline]
     pub fn replace(&self, new: T) -> Result<(), anyhow::Error> {
         if self.counter.load(SeqCst) != 0 {
             return Ok(());

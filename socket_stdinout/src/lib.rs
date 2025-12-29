@@ -168,22 +168,20 @@ fn load_new_stream(
     kill: &AtomicBool, debug_fname: &str, 
     new_stream: &CRwLock<UnixStream, NUM_THREADS>, stream: &mut UnixStream,
 ) {
-    if new_stream.count().load(SeqCst) != 0 {
-        let new_stream_guard = new_stream.read();
-        if let Err(ref e) = new_stream_guard {
-            kill_thread(kill, debug_fname, &e.to_string());
-        }
+    let new_stream_guard = new_stream.read();
+    if let Err(ref e) = new_stream_guard {
+        kill_thread(kill, debug_fname, &e.to_string());
+    }
 
-        let new_stream_res = (*(new_stream_guard.unwrap())).try_clone();
+    let new_stream_res = (*(new_stream_guard.unwrap())).try_clone();
 
-        if let Err(ref e) = new_stream_res {
-            kill_thread(kill, debug_fname, &e.to_string());
-        }
+    if let Err(ref e) = new_stream_res {
+        kill_thread(kill, debug_fname, &e.to_string());
+    }
 
-        *stream = new_stream_res.unwrap();
+    *stream = new_stream_res.unwrap();
 
-        return;    
-    } 
+    return;    
 } 
 
 struct SockReaderFdWriter<T: Write + Send> {
@@ -204,14 +202,14 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
         let mut header = MsgHeader::new();
 
         'reconn: loop {
-            load_new_stream(
-                &self.kill, Self::DEBUG_FNAME, 
-                &self.new_stream, &mut self.stream); 
+            if self.new_stream.count().load(SeqCst) != 0 {
+                load_new_stream(
+                    &self.kill, Self::DEBUG_FNAME, 
+                    &self.new_stream, &mut self.stream); 
 
-            if self.model == Model::Client 
-                && self.new_stream.count().load(SeqCst) == 0 
-            {
-                self.send_disconn_msg();
+                if self.model == Model::Client {
+                    self.send_disconn_msg();
+                }
             }
         loop {
             if self.kill.load(SeqCst) { panic!("{}", MSG_KILL_TRIG) }
@@ -297,8 +295,8 @@ impl<T: Read + Send> SockWriterFdReader<T> {
         let mut guard = false;
 
         'reconn: loop {
-            match self.model {
-                Model::Client => {
+            match self.model  {
+                Model::Client if self.new_stream.count().load(SeqCst) != 0 => {
                     // This can kill the thread on failure
                     load_new_stream(
                         &self.kill, Self::DEBUG_FNAME,
