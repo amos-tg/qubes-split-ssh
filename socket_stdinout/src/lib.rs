@@ -224,9 +224,7 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
                     } 
                 }
 
-                Err(ref e) if is_io_err_minor(e) => {
-                    continue; 
-                }
+                Err(ref e) if is_io_err_minor(e) => continue, 
 
                 Err(e) => kill_thread(
                     &self.kill, Self::DEBUG_FNAME, &e.to_string()),
@@ -418,7 +416,8 @@ fn stream_and_touts(
 
 #[inline(always)]
 fn touts(stream: &UnixStream) -> Result<(), io::Error> {
-    const TOUT_SECS: Duration = Duration::from_secs(2);
+    const TOUT_SECS: Duration = Duration::from_secs(10);
+
     stream.set_read_timeout(Some(TOUT_SECS))?; 
     stream.set_write_timeout(Some(TOUT_SECS))?;
     return Ok(());
