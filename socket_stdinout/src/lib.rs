@@ -208,7 +208,9 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
                 &self.kill, Self::DEBUG_FNAME, 
                 &self.new_stream, &mut self.stream); 
 
-            if self.model == Model::Client {
+            if self.model == Model::Client 
+                && self.new_stream.count().load(SeqCst) == 0 
+            {
                 self.send_disconn_msg();
             }
         loop {
@@ -292,6 +294,7 @@ impl<T: Read + Send> SockWriterFdReader<T> {
         let mut header = MsgHeader::new();
         let mut cursor: usize;
         let mut msg_len;
+        let mut guard = false;
 
         'reconn: loop {
             match self.model {
@@ -302,7 +305,7 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                         &self.new_stream, &mut self.stream);
                 }
 
-                Model::Server => {
+                Model::Server if guard => {
                     if let Err(e) = self.disconn_ssh_agent() {
                         kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
                     }   
@@ -314,8 +317,11 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                         kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
                     }   
                 }
+
+                _ => (),
             } 
         loop {
+            guard = true;
             cursor = 0; 
 
             if self.kill.load(SeqCst) { 
@@ -396,6 +402,7 @@ impl<T: Read + Send> SockWriterFdReader<T> {
         let sock = conn_ssh_agent()?; 
         touts(&sock)?;
         self.new_stream.replace(sock)?;
+        self.new_stream.count().fetch_sub(1, SeqCst);
         return Ok(());
     }
 }
