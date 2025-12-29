@@ -416,10 +416,10 @@ fn stream_and_touts(
 
 #[inline(always)]
 fn touts(stream: &UnixStream) -> Result<(), io::Error> {
-    const TOUT_SECS: Duration = Duration::from_secs(10);
+    const TOUT_TIME: Duration = Duration::from_hours(24);
 
-    stream.set_read_timeout(Some(TOUT_SECS))?; 
-    stream.set_write_timeout(Some(TOUT_SECS))?;
+    stream.set_read_timeout(Some(TOUT_TIME))?; 
+    stream.set_write_timeout(Some(TOUT_TIME))?;
     return Ok(());
 }
 
