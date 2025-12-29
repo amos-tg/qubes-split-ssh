@@ -342,12 +342,12 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                 }
             }
 
+            header.clone_from_slice(&buf[..HEADER_LEN]);
+            msg_len = header.len() as usize; 
+
             if header[FLAGS_INDEX] == RECONN {
                 continue 'reconn;
             }
-
-            header.clone_from_slice(&buf[..HEADER_LEN]);
-            msg_len = header.len() as usize; 
 
             while cursor < msg_len {
                 match self.fd.read(&mut buf[cursor..]) {
