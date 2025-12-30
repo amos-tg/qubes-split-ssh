@@ -260,7 +260,6 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
         let mut header = MsgHeader::new();  
 
         header.update(EMPTY, RECONN);
-        
 
         while cursor < HEADER_LEN {
             match self.fd.write(&*header) {
@@ -270,6 +269,10 @@ impl<T: Write + Send> SockReaderFdWriter<T> {
 
                 Err(e) => kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()),
             }
+        }
+
+        if let Err(e) = self.fd.flush() {
+            kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()); 
         }
     } 
 }
@@ -287,98 +290,131 @@ impl<T: Read + Send> SockWriterFdReader<T> {
 
     pub fn spawn(mut self) {
         let mut buf = [0u8; KIB64];
-        let mut header = MsgHeader::new();
-        let mut cursor: usize;
-        let mut msg_len;
-        let mut guard = false;
+        let mut cursor: usize = 0;
+        let mut start_idx: usize = 0;
+
+        cursor += self.read_more(&mut buf, start_idx);
 
         'reconn: loop {
-            match self.model  {
-                Model::Client if self.new_stream.count().load(SeqCst) != 0 => {
-                    // This can kill the thread on failure
-                    load_new_stream(
-                        &self.kill, Self::DEBUG_FNAME,
-                        &self.new_stream, &mut self.stream);
-                }
-
-                Model::Server if guard => {
-                    if let Err(e) = self.disconn_ssh_agent() {
-                        kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
-                    }   
-
-                    // supposedly ssh-agent connections don't timeout by default 
-                    // so it's fine in this case to wait an indeterminate amount
-                    // of time for the next connection.
-                    if let Err(e) = self.reconn_ssh_agent() {
-                        kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
-                    }   
-                }
-
-                _ => (),
-            } 
-        loop {
-            guard = true;
-            cursor = 0; 
-
-            if self.kill.load(SeqCst) { 
-                panic!("{}", MSG_KILL_TRIG) 
+            if self.model == Model::Client 
+                && self.new_stream.count().load(SeqCst) != 0 
+            {
+                load_new_stream(
+                    &self.kill, Self::DEBUG_FNAME,
+                    &self.new_stream, &mut self.stream);
             }
+        loop {
+            // If there are more bytes read than the header msg_len indicates 
+            // the index is advanced to the next frame for handling on the following 
+            // iteration; otherwise the cursor is reset to zero.
+            match Self::get_frame_state(&buf, start_idx, cursor) {
+                Frame::Partial => cursor += self.read_more(&mut buf, cursor),
 
-            while cursor < HEADER_LEN {
-                match self.fd.read(&mut buf[cursor..]) {
-                    Ok(nb) => {
-                        if nb != 0 {
-                            cursor += nb; 
-                        } else {
-                            continue;
-                        }
+                Frame::MadeReset => {
+                    if self.write_frame(&buf, start_idx, cursor) {
+                        continue 'reconn;
                     }
 
-                    Err(ref e) if is_io_err_minor(e) => continue,
-
-                    Err(e) => kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()),
+                    cursor = 0; 
+                    start_idx = 0;
                 }
-            }
 
-            header.clone_from_slice(&buf[..HEADER_LEN]);
-            msg_len = header.len() as usize; 
+                Frame::MadeWithMore(frame_endex) => {
+                    if self.write_frame(&buf, start_idx, frame_endex) {
+                        continue 'reconn; 
+                    }
 
-            if header[FLAGS_INDEX] == RECONN {
-                continue 'reconn;
-            }
+                    start_idx = frame_endex;
+                },
 
-            while cursor < msg_len {
-                match self.fd.read(&mut buf[cursor..]) {
-                    Ok(nb) => { 
-                        if nb != 0 {
-                            cursor += nb;
-                        } 
-                    } 
+                Frame::Reconn => {
+                    if let Err(e) = self.disconn_ssh_agent() {
+                        kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
+                    }
 
-                    Err(ref e) if is_io_err_minor(e) => continue,
-
-                    Err(e) => kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()),
-                }
-            }
-
-            cursor = HEADER_LEN;
-
-            while cursor < msg_len {
-                match self.stream.write(&buf[cursor..msg_len]) {
-                    Ok(nb) => cursor += nb,
-                    
-                    Err(ref e) if is_io_err_minor(e) => continue,
-
-                    Err(e) if e.kind() == BrokenPipe => continue 'reconn, 
-
-                    Err(e) => kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()),
-                }
-            } 
-
-            if let Err(e) = self.stream.flush() {
-                kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
-            }
+                    if let Err(e) = self.reconn_ssh_agent() {
+                        kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
+                    }
+                },
+            }                                    
         }}
+    }
+
+    /// advances cursor by the number of bytes read.
+    /// cursor signifies the end of the raw data read.
+    /// start_idx..cursor == the full frame of data.
+    fn read_more(&mut self, buf: &mut [u8; KIB64], start_idx: usize) -> usize {
+        loop {
+            match self.fd.read(&mut buf[start_idx..]) {
+                Ok(nb) => if nb != 0 {
+                    return nb; 
+                } 
+
+                Err(ref e) if is_io_err_minor(e) => continue,
+
+                Err(e) => kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()),
+            }
+        }
+    }
+
+    /// start_idx: the start of the frame.
+    /// cursor: the end of the frame.
+    ///
+    /// Returns whether the frame is:
+    ///     Frame::Reconn : asking for reconnection 
+    ///     Frame::MadeReset : full message with no extra, post reading reset
+    ///         the cursor and start_idx
+    ///     Frame::MadeWithMore : full message with extra, do not reset indices
+    ///     Frame::Partial : there isn't a single full frame within the indices 
+    ///
+    /// remember to add to start_idx, before writing to exclude the header.
+    fn get_frame_state(
+        buf: &[u8; KIB64], start_idx: usize, cursor: usize,
+    ) -> Frame {
+        if (cursor - start_idx) < HEADER_LEN {
+            return Frame::Partial; 
+        }
+
+        let mut header = MsgHeader::new(); 
+
+        header.copy_from_slice(&buf[start_idx..(start_idx + HEADER_LEN)]);
+        let frame_len = header.len() as usize + start_idx;              
+
+        if header[FLAGS_INDEX] == RECONN {
+            return Frame::Reconn;
+        } else if frame_len == cursor {
+            return Frame::MadeReset;
+        } else if frame_len < cursor {
+            return Frame::MadeWithMore(frame_len);
+        } else { 
+            return Frame::Partial;
+        }
+    }
+
+    /// writes the data in buf from start_idx to end_idx into self.stream.
+    /// returns true if writing encounters a broken pipe i.e. reconnect.
+    /// returns false if no errors are encountered during the process.
+    fn write_frame(
+        &mut self, buf: &[u8; KIB64],
+        mut start_idx: usize, end_idx: usize,
+    ) -> bool {
+        while start_idx < end_idx {
+            match self.stream.write(&buf[start_idx..end_idx]) {
+                Ok(nb) => start_idx += nb,
+                
+                Err(ref e) if is_io_err_minor(e) => continue,
+
+                Err(e) if e.kind() == BrokenPipe => return true, 
+
+                Err(e) => kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string()),
+            }
+        } 
+
+        if let Err(e) = self.stream.flush() {
+            kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
+        }
+
+        return false;
     }
 
     /// shuts down the read and right halves of the UnixStream
@@ -401,6 +437,14 @@ impl<T: Read + Send> SockWriterFdReader<T> {
         self.new_stream.count().fetch_sub(1, SeqCst);
         return Ok(());
     }
+}
+
+enum Frame {
+    Partial,
+    MadeReset, 
+    /// the index returned is the first frame boundary
+    MadeWithMore(usize),
+    Reconn,
 }
 
 /// Returns a UnixStream with rw timeouts set or an  
