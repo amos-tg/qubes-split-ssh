@@ -307,7 +307,7 @@ impl<T: Read + Send> SockWriterFdReader<T> {
             // If there are more bytes read than the header msg_len indicates 
             // the index is advanced to the next frame for handling on the following 
             // iteration; otherwise the cursor is reset to zero.
-            match Self::get_frame_state(&buf, start_idx, cursor) {
+            match Self::get_frame_state(&mut buf, &mut start_idx, &mut cursor) {
                 Frame::Partial => cursor += self.read_more(&mut buf, cursor),
 
                 Frame::MadeReset => {
@@ -369,22 +369,28 @@ impl<T: Read + Send> SockWriterFdReader<T> {
     ///
     /// remember to add to start_idx, before writing to exclude the header.
     fn get_frame_state(
-        buf: &[u8; KIB64], start_idx: usize, cursor: usize,
+        buf: &mut [u8; KIB64], start_idx: &mut usize, cursor: &mut usize,
     ) -> Frame {
-        if (cursor - start_idx) < HEADER_LEN {
+        if *cursor >= KIB64 && *start_idx != 0 {
+            buf.copy_within(*start_idx..*cursor, 0);
+            *cursor = *cursor - *start_idx;
+            *start_idx = 0; 
+        }
+
+        if  (*cursor - *start_idx) < HEADER_LEN {
             return Frame::Partial; 
         }
 
         let mut header = MsgHeader::new(); 
 
-        header.copy_from_slice(&buf[start_idx..(start_idx + HEADER_LEN)]);
-        let frame_len = header.len() as usize + start_idx;              
+        header.copy_from_slice(&buf[*start_idx..(*start_idx + HEADER_LEN)]);
+        let frame_len = header.len() as usize + *start_idx;              
 
         if header[FLAGS_INDEX] == RECONN {
             return Frame::Reconn;
-        } else if frame_len == cursor {
+        } else if frame_len == *cursor {
             return Frame::MadeReset;
-        } else if frame_len < cursor {
+        } else if frame_len < *cursor {
             return Frame::MadeWithMore(frame_len);
         } else { 
             return Frame::Partial;
