@@ -331,7 +331,7 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                     start_idx = frame_endex;
                 },
 
-                Frame::Reconn => {
+                Frame::ReconnReset => {
                     if let Err(e) = self.disconn_ssh_agent() {
                         kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
                     }
@@ -343,6 +343,18 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                     start_idx = 0; 
                     cursor = 0;
                 },
+
+                Frame::ReconnWithMore(frame_endex) => {
+                    if let Err(e) = self.disconn_ssh_agent() {
+                        kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
+                    }
+
+                    if let Err(e) = self.reconn_ssh_agent() {
+                        kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
+                    }
+
+                    start_idx = frame_endex;
+                }
             }                                    
         }}
     }
@@ -393,8 +405,12 @@ impl<T: Read + Send> SockWriterFdReader<T> {
         header.copy_from_slice(&buf[*start_idx..(*start_idx + HEADER_LEN)]);
         let frame_len = header.len() as usize + *start_idx;              
 
-        if header[FLAGS_INDEX] == RECONN {
-            return Frame::Reconn;
+        if header[FLAGS_INDEX] == RECONN 
+            && (*cursor - *start_idx) == HEADER_LEN 
+        {
+            return Frame::ReconnReset;
+        } else if header[FLAGS_INDEX] == RECONN {
+            return Frame::ReconnWithMore(*start_idx + HEADER_LEN);
         } else if frame_len == *cursor {
             return Frame::MadeReset;
         } else if frame_len < *cursor {
@@ -454,10 +470,14 @@ impl<T: Read + Send> SockWriterFdReader<T> {
 
 enum Frame {
     Partial,
+
     MadeReset, 
     /// the index returned is the first frame boundary
     MadeWithMore(usize),
-    Reconn,
+
+    ReconnReset,
+    /// the index returned is the first frame boundary
+    ReconnWithMore(usize),
 }
 
 /// Returns a UnixStream with rw timeouts set or an  
