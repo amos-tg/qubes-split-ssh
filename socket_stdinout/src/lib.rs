@@ -311,6 +311,8 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                 Frame::Partial => cursor += self.read_more(&mut buf, cursor),
 
                 Frame::MadeReset => {
+                    start_idx += HEADER_LEN;
+
                     if self.write_frame(&buf, start_idx, cursor) {
                         continue 'reconn;
                     }
@@ -320,6 +322,8 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                 }
 
                 Frame::MadeWithMore(frame_endex) => {
+                    start_idx += HEADER_LEN;
+
                     if self.write_frame(&buf, start_idx, frame_endex) {
                         continue 'reconn; 
                     }
@@ -335,6 +339,9 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                     if let Err(e) = self.reconn_ssh_agent() {
                         kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
                     }
+
+                    start_idx = 0; 
+                    cursor = 0;
                 },
             }                                    
         }}
