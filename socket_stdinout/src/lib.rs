@@ -29,7 +29,6 @@ use std::{
             BrokenPipe,
         },
     },
-    net::Shutdown,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering::*},
@@ -181,6 +180,8 @@ fn load_new_stream(
 
     *stream = new_stream_res.unwrap();
 
+    new_stream.count().fetch_sub(1, SeqCst);
+
     return;    
 } 
 
@@ -304,9 +305,6 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                     &self.new_stream, &mut self.stream);
             }
         loop {
-            // If there are more bytes read than the header msg_len indicates 
-            // the index is advanced to the next frame for handling on the following 
-            // iteration; otherwise the cursor is reset to zero.
             match Self::get_frame_state(&mut buf, &mut start_idx, &mut cursor) {
                 Frame::Partial => cursor += self.read_more(&mut buf, cursor),
 
@@ -314,6 +312,7 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                     start_idx += HEADER_LEN;
 
                     if self.write_frame(&buf, start_idx, cursor) {
+                        start_idx -= HEADER_LEN;
                         continue 'reconn;
                     }
 
@@ -325,6 +324,7 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                     start_idx += HEADER_LEN;
 
                     if self.write_frame(&buf, start_idx, frame_endex) {
+                        start_idx -= HEADER_LEN;
                         continue 'reconn; 
                     }
 
@@ -332,10 +332,6 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                 },
 
                 Frame::ReconnReset => {
-                    if let Err(e) = self.disconn_ssh_agent() {
-                        kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
-                    }
-
                     if let Err(e) = self.reconn_ssh_agent() {
                         kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
                     }
@@ -345,10 +341,6 @@ impl<T: Read + Send> SockWriterFdReader<T> {
                 },
 
                 Frame::ReconnWithMore(frame_endex) => {
-                    if let Err(e) = self.disconn_ssh_agent() {
-                        kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
-                    }
-
                     if let Err(e) = self.reconn_ssh_agent() {
                         kill_thread(&self.kill, Self::DEBUG_FNAME, &e.to_string());
                     }
@@ -444,14 +436,6 @@ impl<T: Read + Send> SockWriterFdReader<T> {
         }
 
         return false;
-    }
-
-    /// shuts down the read and right halves of the UnixStream
-    /// in self.stream.
-    #[inline]
-    fn disconn_ssh_agent(&mut self) -> io::Result<()> {
-        self.stream.shutdown(Shutdown::Both)?; 
-        return Ok(());
     }
 
     /// Gets a new connection to the ssh-agent; blocks until the new 
