@@ -5,55 +5,63 @@ use std::{
         atomic::{AtomicUsize, Ordering::*},
         LockResult,
         RwLockReadGuard,
+        TryLockError,
     },
 };
 
-/// the atomic counter from ref_count() needs to be 
-/// zero in order to get a mutable reference to the 
-/// data. The counter is reset to NUM_RX (number of 
-/// receivers) whenever a mutable reference to the
-/// data is taken. 
-pub struct CRwLock<T, const NUM_RX: usize> {
+pub struct CRwLock<T> {
     data: RwLock<T>,
     counter: AtomicUsize,
+    reset: usize,
 }
 
-impl<T, const NUM_RX: usize> CRwLock<T, NUM_RX> {
-    /// Counter starts at zero
-    pub fn new(data: T) -> Self {
+impl<T> CRwLock<T> {
+    pub fn new(data: T, num_recievers: usize) -> Self {
         let data = RwLock::new(data);
-        let counter = AtomicUsize::new(0usize);
-        return Self { data, counter };
+        let counter = AtomicUsize::new(num_recievers);
+        return Self { data, counter, reset: num_recievers };
     }
 
-    #[inline]
-    pub fn read(&self) -> LockResult<RwLockReadGuard<'_, T>> {
-        return self.data.read(); 
+    pub fn read(&self) -> Option<LockResult<RwLockReadGuard<'_, T>>> {
+        let current: usize = self.counter.load(SeqCst); 
+        if current == 0 { return None; }
+        
+        // this sucks... 
+        match self.counter
+            .compare_exchange(current, current - 1, SeqCst, Relaxed)
+        {
+            Ok(_) => (),
+            Err(_) => (),
+        }
+
+        return Some(self.data.read()); 
     }
 
-    /// replaces the data inside the RwLock<T> with the new: T argument
-    /// Returns an anyhow::Error "Error: Poisened Mutex" if the RwLock
-    /// is poisened.
-    /// 
-    /// This function blocks until it writes the new: T value into
-    /// the inner RwLock<T>.
+    /// Replaces the data inside the container if the counter == 0.
+    /// Otherwise, does nothing and returns early. Function is blocking
+    /// and handles multiple replacements at the same time, pre-empted 
+    /// replacers return early having done nothing.
     pub fn replace(&self, new: T) -> Result<(), anyhow::Error> {
-        if self.counter.load(SeqCst) != 0 {
-            return Ok(());
-        }  
+        loop { 
+            if self.counter.load(SeqCst) != 0 {
+                return Ok(());
+            }  
 
-        let _ = self.counter.swap(NUM_RX, SeqCst);
+            match self.data.try_write() {
+                Ok(mut mref_data) => *mref_data = new,
+                Err(TryLockError::WouldBlock) => continue,
+                Err(TryLockError::Poisoned(_)) => 
+                    return Err(anyhow!("Error: Poisoned Mutex")),
+            };
 
-        match self.data.write() {
-            Ok(mut mref_data) => *mref_data = new,
-            Err(_) => return Err(anyhow!("Error: Poisoned Mutex")),
-        };
+            break;
+        }
+
+        match self.counter.compare_exchange(0, self.reset, SeqCst, Relaxed) {
+            Ok(_) => (),
+            Err(_) => return Ok(()),
+        }
 
         return Ok(());
-    }
-
-    #[inline]
-    pub fn count(&self) -> &AtomicUsize {
-        return &self.counter;
     }
 }
